@@ -1,0 +1,13 @@
+__pycache__
+*.pt
+*.bak
+*.log
+*.jsonl
+.vscode/
+accuracy/transformers/
+*.egg-info/
+test*.py
+logs/
+rag_data*/
+*.zst
+*.gz
