@@ -16,6 +16,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer, AutoConfig
 from sentence_transformers import SentenceTransformer
 from langchain_community.vectorstores import FAISS
+import faiss
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores.utils import DistanceStrategy
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -59,18 +60,6 @@ def process_doc_initializer(tokenizer_name, chunk_size):
     )
 
 
-def process_doc(doc, tokenizer_name, chunk_size):
-    text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-        AutoTokenizer.from_pretrained(tokenizer_name),
-        chunk_size=chunk_size,
-        chunk_overlap=int(chunk_size / 10),
-        add_start_index=True,
-        strip_whitespace=True,
-        separators=MARKDOWN_SEPARATORS,
-    )
-    return text_splitter.split_documents([doc])
-
-
 def batch_process_docs(docs_batch):
     global text_splitter
     results = []
@@ -86,7 +75,7 @@ def split_documents(
     batch_size: int = 100,
 ) -> List[LangchainDocument]:
     """Split documents into chunks with batching"""
-    num_processes = min(os.cpu_count(), 64)
+    num_processes = os.cpu_count()
 
     # 初始化分词器
     process_doc_partial = functools.partial(batch_process_docs)
@@ -125,7 +114,7 @@ def save_vector_database(vector_db, save_path):
 
     # 保存 FAISS 索引
     print("Saving FAISS index...")
-    faiss_version.write_index(vector_db.index, str(save_path / "faiss.index"))
+    faiss.write_index(vector_db.index, str(save_path / "faiss.index"))
 
     # 保存 docstore
     print("Saving docstore...")
@@ -145,45 +134,22 @@ def load_knowledge_base(load_path):
         return pickle.load(f)
 
 
-def load_vector_database(load_path, embedding_model):
-    """Load FAISS index (optionally to GPU), docstore, and index_to_docstore_id."""
-    load_path = Path(load_path)
-
-    t0 = time.time()
-    # 1) 读取 faiss.index
-    print("Loading FAISS index...")
-    index = faiss_version.read_index(str(load_path / "faiss.index"))
-    print(f"Index type: {type(index)}")
-
-    # 若可用 GPU, 则将 faiss 索引搬到 GPU
-    print("Moving FAISS index to GPU...")
-    if torch.cuda.is_available():
-        res = faiss_version.StandardGpuResources()
-        res.setTempMemory(1024 * 1024 * 1024)
-        index = faiss_version.index_cpu_to_gpu(res, 0, index)
-    t1 = time.time()
-    print(f"Index type: {type(index)}")
-
-    print_gpu_memory_usage("After moving FAISS index to GPU")
-    print(f"[TIMING] Loding FAISS index to GPU took {t1 - t0:.4f} seconds")
-
+def load_vector_db_shard_faiss(shard_path: str, embedding_model) -> FAISS:
+    """
+    从指定目录 shard_path 加载 FAISS 索引、docstore、index_to_docstore_id，
+    构建并返回一个 FAISS 对象（使用 langchain_community.vectorstores.FAISS）。
+    """
+    shard_path = Path(shard_path)
+    print(f"[load_vector_db_shard_faiss] Loading shard from {shard_path} ...")
+    # 1) 读取 FAISS 索引
+    index = faiss_version.read_index(str(shard_path / "faiss.index"))
     # 2) 读取 docstore
-    print("Loading docstore...")
-    t0 = time.time()
-    with open(load_path / "docstore.pkl", "rb") as f:
+    with open(shard_path / "docstore.pkl", "rb") as f:
         docstore = pickle.load(f)
-    t1 = time.time()
-    print(f"[TIMING] Loading docstore took {t1 - t0:.4f} seconds")
-
     # 3) 读取 index_to_docstore_id
-    print("Loading index_to_docstore_id...")
-    t0 = time.time()
-    with open(load_path / "index_to_docstore_id.pkl", "rb") as f:
+    with open(shard_path / "index_to_docstore_id.pkl", "rb") as f:
         index_to_docstore_id = pickle.load(f)
-    t1 = time.time()
-    print(f"[TIMING] Loading index_to_docstore_id took {t1 - t0:.4f} seconds")
-
-    # 4) 初始化 FAISS 对象
+    # 4) 构造 FAISS 对象
     vector_db = FAISS(
         embedding_function=embedding_model.embed_query,
         index=index,
@@ -192,22 +158,6 @@ def load_vector_database(load_path, embedding_model):
         distance_strategy=DistanceStrategy.COSINE,
     )
     return vector_db
-
-
-def load_oscar_data(file_path: str, max_docs: int = 1000):
-    """Load OSCAR dataset from .zst file"""
-    docs = []
-    with open(file_path, "rb") as fh:
-        dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(fh) as reader:
-            text = reader.read().decode("utf-8")
-            for i, line in enumerate(tqdm(text.split("\n"))):
-                # if i >= max_docs:
-                #     break
-                if line:
-                    doc = json.loads(line)
-                    docs.append(LangchainDocument(page_content=doc["content"], metadata={"source": f"oscar_doc_{i}"}))
-    return docs
 
 
 def load_nq_data(file_path: str, max_docs: int = None):
@@ -231,34 +181,67 @@ def load_nq_data(file_path: str, max_docs: int = None):
     return docs, questions
 
 
-def build_index():
-    """Build and save knowledge base and vector database"""
+def build_index_shard_faiss():
+    """
+    将原始文档分成大约 1/10 的块，
+    对每一块先进行多进程分词，再用 FAISS.from_documents 构建索引，
+    构建完一块后立刻保存到对应的子目录，并释放内存。
+    """
+    # 加载原始数据（可根据需要设定 max_docs）
+    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz")
+    total_docs = len(RAW_KNOWLEDGE_BASE)
+    print(f"[build_index_shard_faiss] Total docs: {total_docs}")
 
-    # RAW_KNOWLEDGE_BASE = load_oscar_data("en_meta_part_1.jsonl.zst")
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=100000)
+    # 以大约 1/10 为一片
+    shard_count = 20
+    docs_per_shard = total_docs // shard_count + 1
 
-    docs_processed = split_documents(
-        512,
-        RAW_KNOWLEDGE_BASE,
-        tokenizer_name=EMBEDDING_MODEL_NAME,
-    )
+    shards_dir = Path("rag_data_faiss_shard")
+    shards_dir.mkdir(parents=True, exist_ok=True)
 
+    # 初始化嵌入模型
     embedding_model = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
         multi_process=True,
         model_kwargs={"device": "cuda"},
-        encode_kwargs={"normalize_embeddings": False},
+        encode_kwargs={"normalize_embeddings": False},  # FAISS内部会处理距离
     )
 
-    print("Building vector database...")
-    KNOWLEDGE_VECTOR_DATABASE = FAISS.from_documents(
-        docs_processed, embedding_model, distance_strategy=DistanceStrategy.COSINE
-    )
+    for i in range(shard_count):
+        start_idx = i * docs_per_shard
+        if start_idx >= total_docs:
+            break
+        end_idx = min((i + 1) * docs_per_shard, total_docs)
+        chunk_docs = RAW_KNOWLEDGE_BASE[start_idx:end_idx]
+        print(
+            f"[build_index_shard_faiss] Shard {i}: processing docs {start_idx} to {end_idx} (size={len(chunk_docs)})"
+        )
 
-    save_path = Path("rag_data")
-    # save_knowledge_base(RAW_KNOWLEDGE_BASE, save_path)
-    save_data(RAW_KNOWLEDGE_BASE, questions, save_path)
-    save_vector_database(KNOWLEDGE_VECTOR_DATABASE, save_path)
+        # 对当前分片做多进程分词
+        splitted_docs = split_documents(
+            chunk_size=512, knowledge_base=chunk_docs, tokenizer_name=EMBEDDING_MODEL_NAME, batch_size=100
+        )
+        print(f"[build_index_shard_faiss] Shard {i}: splitted docs count = {len(splitted_docs)}")
+
+        # 利用 FAISS.from_documents 构建向量数据库
+        shard_vector_db = FAISS.from_documents(
+            splitted_docs, embedding_model, distance_strategy=DistanceStrategy.COSINE
+        )
+
+        # 保存当前分片：在子目录 shard_i 下保存 FAISS 索引、docstore、index_to_docstore_id
+        shard_dir = shards_dir / f"shard_{i}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        save_vector_database(shard_vector_db, str(shard_dir))
+
+        # 释放内存：删除当前分片的中间变量，并调用 torch.cuda.empty_cache()
+        del chunk_docs, splitted_docs, shard_vector_db
+        torch.cuda.empty_cache()
+
+    # 最后统一保存 questions
+    with open(shards_dir / "questions.pkl", "wb") as f:
+        pickle.dump(questions, f)
+
+    print("[build_index_shard_faiss] Done building all FAISS shards.")
 
 
 def print_gpu_memory_usage(step_name: str):
@@ -280,38 +263,49 @@ def save_data(docs, questions, save_path):
         pickle.dump(questions, f)
 
 
-def batch_similarity_search(vector_db, queries: List[str], embedding_model, k=1):
-    """使用 FAISS 批量查询进行相似度搜索"""
-    import numpy as np
+def batch_similarity_search_shard_faiss(shards_dir: str, queries: List[str], embedding_model, k=3):
+    """
+    对指定目录下的所有分片进行检索，合并每个分片的 Top K 结果，最终返回全局 Top K。
+    返回值：List[List[Document]]，每个查询对应一个文档列表。
+    """
+    shards_dir = Path(shards_dir)
+    # 找到所有 shard_x 目录，排序保证顺序 shard_0, shard_1, ...
+    shard_paths = sorted(
+        [p for p in shards_dir.iterdir() if p.is_dir() and p.name.startswith("shard_")], key=lambda p: p.name
+    )
+    print(f"[batch_similarity_search_shard_faiss] Found {len(shard_paths)} shards.")
 
-    # 确保 queries 是一个字符串列表
-    if not all(isinstance(query, str) for query in queries):
-        raise ValueError("All queries must be strings.")
-
-    # 使用 embed_documents 获取批量查询嵌入
-    query_embeddings = embedding_model.embed_documents(queries)  # Shape: (num_queries, embedding_dim)
-
-    # 将 query_embeddings 转换为 numpy.ndarray
+    # 生成查询向量（假设 embed_documents 返回 numpy 数组或 list）
+    query_embeddings = embedding_model.embed_documents(queries)
     if isinstance(query_embeddings, list):
         query_embeddings = np.array(query_embeddings)
+    M = len(queries)
+    # 对每个查询，累计存储候选 (similarity, doc)
+    all_candidates = [[] for _ in range(M)]
 
-    # 使用 FAISS 的批量查询功能
-    distances, indices = vector_db.index.search(query_embeddings, k)
-
-    # 将结果转换为文档列表
-    results = []
-    for query_idx in range(len(queries)):
-        docs = []
-        for idx in indices[query_idx]:
-            if idx != -1:
-                doc_id = str(vector_db.index_to_docstore_id[idx])
-                # 使用 get_document 方法获取文档
-                doc = vector_db.docstore.search(doc_id)
-                if doc:
-                    docs.append(doc)
-        results.append(docs)
-
-    return results
+    # 依次对每个 shard执行检索
+    for shard_path in shard_paths:
+        vector_db = load_vector_db_shard_faiss(str(shard_path), embedding_model)
+        print(f"[batch_similarity_search_shard_faiss] Searching in {shard_path.name} ...")
+        distances, indices = vector_db.index.search(query_embeddings, k)
+        for i in range(M):
+            for j in range(k):
+                idx = indices[i][j]
+                if idx != -1:
+                    # 注意：index_to_docstore_id 中存储的 doc_id 是字符串
+                    doc_id = str(vector_db.index_to_docstore_id[idx])
+                    # 这里假设 docstore 是一个 dict，直接用 get() 获取文档
+                    doc = vector_db.docstore.get(doc_id)
+                    if doc is not None:
+                        all_candidates[i].append((distances[i][j], doc))
+        del vector_db
+    # 对每个查询，合并所有候选后排序取前 k
+    final_results = []
+    for i in range(M):
+        sorted_candidates = sorted(all_candidates[i], key=lambda x: x[0], reverse=True)
+        top_k_docs = [doc for (score, doc) in sorted_candidates[:k]]
+        final_results.append(top_k_docs)
+    return final_results
 
 
 def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_docs, max_new_tokens=500):
@@ -352,63 +346,41 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
     return all_responses
 
 
-def batch_query(queries: List[str], embedding_model, batch_size: int = 32):
-    """批量查询"""
-    load_path = Path("rag_data")
+def batch_query_shard_faiss(queries: List[str], embedding_model, batch_size: int = 32):
+    """
+    使用分片化的 FAISS 索引进行批量查询：
+      - 依次加载每个 shard 进行检索，
+      - 合并各 shard 检索结果，
+      - 调用生成模型生成回答。
+    """
+    shards_dir = Path("rag_data_faiss_shard")
 
-    # Step 1: Load vector database
-    vector_db = load_vector_database(load_path, embedding_model)
-    print_gpu_memory_usage("After loading vector database")
-
-    # Step 2: Load language model and tokenizer
+    # Step 1: 加载语言模型和 tokenizer（例如 Llama）
     READER_MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    model = AutoModelForCausalLM.from_pretrained(
-        READER_MODEL_NAME,
-        device_map="cpu",
-    )
-    print(f"Model loaded on devices: {model.hf_device_map}")
+    model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, device_map="cpu")
     tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
-    print_gpu_memory_usage("After loading language model and tokenizer")
 
-    # Step 3: Batch processing
     all_answers = []
     for i in range(0, len(queries), batch_size):
         batch_queries = queries[i : i + batch_size]
-        print(f"\nProcessing batch {i // batch_size + 1} with {len(batch_queries)} queries...")
-
-        # Batch similarity search
-        t0 = time.time()
-        batch_retrieved_docs = batch_similarity_search(vector_db, batch_queries, embedding_model, k=3)
-        t1 = time.time()
-        print(f"[TIMING] batch_similarity_search took {t1 - t0:.4f} seconds")
-
-        # Batch response generation
-        t0 = time.time()
-        batch_responses = batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_docs)
-        t1 = time.time()
-        print(f"[TIMING] batch_generate_responses took {t1 - t0:.4f} seconds")
-
-        # 保存结果
-        for query, response, retrieved_docs in zip(batch_queries, batch_responses, batch_retrieved_docs):
-            retrieved_docs_text = [doc.page_content for doc in retrieved_docs]
-            context = "\nExtracted documents:\n"
-            context += "".join([f"Document {str(i)}:::\n" + doc for i, doc in enumerate(retrieved_docs_text)])
-
-            all_answers.append({"query": query, "answer": response, "context": context})
-
+        # 分片检索：合并各 shard 的结果
+        batch_docs = batch_similarity_search_shard_faiss(str(shards_dir), batch_queries, embedding_model, k=3)
+        # 构造 prompt 并生成回答（调用你已有的 batch_generate_responses）
+        batch_responses = batch_generate_responses(model, tokenizer, batch_queries, batch_docs)
+        for q, resp, docs in zip(batch_queries, batch_responses, batch_docs):
+            context = "\n".join(doc.page_content for doc in docs)
+            all_answers.append({"query": q, "answer": resp, "context": context})
     return all_answers
 
 
 if __name__ == "__main__":
     # First time: build and save index
-    # build_index()
+    build_index_shard_faiss()
 
-    # Query time: load and query
-    # Load saved questions
-    with open(Path("rag_data") / "questions.pkl", "rb") as f:
+    # 查询时：加载 questions，并使用分片检索
+    with open(Path("rag_data_faiss_shard") / "questions.pkl", "rb") as f:
         questions = pickle.load(f)
 
-    # 初始化嵌入模型
     embedding_model = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
         multi_process=True,
@@ -416,13 +388,10 @@ if __name__ == "__main__":
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # 提取要查询的问题
-    queries = [q["question"] for q in questions[:4]]  # 取前 64 个问题
-    print(f"Processing {len(queries)} queries...")
+    # 例如查询前 4 个问题
+    queries = [q["question"] for q in questions[:4]]
+    print(f"Processing {len(queries)} queries using shard FAISS ...")
+    answers = batch_query_shard_faiss(queries, embedding_model, batch_size=4)
 
-    # 批量查询和回答生成
-    answers = batch_query(queries, embedding_model, batch_size=4)
-
-    # 打印答案
     for i, result in enumerate(answers):
         print(f"Result {i + 1}: {result['answer']}")

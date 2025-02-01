@@ -123,7 +123,7 @@ class MyTorchVectorDatabase:
         #    需要转成 torch.Tensor
         print("Embedding documents...")
         embeddings_list = embed_documents_with_progress(
-            embedding_model, texts, batch_size=int(len(texts) / 10)
+            embedding_model, texts, batch_size=len(texts)
         )  # => shape (N, D) in NumPy
         embeddings_tensor = torch.tensor(embeddings_list, dtype=torch.float32)
 
@@ -223,25 +223,17 @@ def save_knowledge_base(knowledge_base, save_path):
         pickle.dump(knowledge_base, f)
 
 
-def save_vector_database(vector_db: MyTorchVectorDatabase, save_path: str):
-    """
-    保存 embeddings、docstore、index_to_docstore_id。
-    注意：embedding 是 torch.Tensor，存为 .pt/.bin 等 PyTorch格式 或 npy也行（先转回CPU np.array）
-    """
-    save_path = Path(save_path)
-    save_path.mkdir(parents=True, exist_ok=True)
-
-    print("Saving embeddings to CPU npy for demonstration...")
-    # 要存成 numpy，先移到 CPU 并转 np.array
+def save_vector_db_shard(vector_db: MyTorchVectorDatabase, shard_path: Path):
+    # embeddings => numpy
     embeddings_np = vector_db.embeddings.cpu().numpy()
-    np.save(save_path / "embeddings.npy", embeddings_np)
+    np.save(shard_path / "embeddings.npy", embeddings_np)
 
-    print("Saving docstore...")
-    with open(save_path / "docstore.pkl", "wb") as f:
+    # docstore
+    with open(shard_path / "docstore.pkl", "wb") as f:
         pickle.dump(vector_db.docstore, f)
 
-    print("Saving index_to_docstore_id...")
-    with open(save_path / "index_to_docstore_id.pkl", "wb") as f:
+    # index_to_docstore_id
+    with open(shard_path / "index_to_docstore_id.pkl", "wb") as f:
         pickle.dump(vector_db.index_to_docstore_id, f)
 
 
@@ -252,36 +244,19 @@ def load_knowledge_base(load_path):
         return pickle.load(f)
 
 
-def load_vector_database(load_path: str, device: str = "cuda") -> MyTorchVectorDatabase:
+def load_vector_db_shard(shard_path: Path, device="cpu") -> MyTorchVectorDatabase:
     """
-    从磁盘加载 MyTorchVectorDatabase
+    加载 shard_{i} 目录生成 MyTorchVectorDatabase
     """
-    load_path = Path(load_path)
-
-    print("Loading embeddings...")
-    t0 = time.time()
-    embeddings_np = np.load(load_path / "embeddings.npy")
-    # 转回 torch.Tensor 并放到指定 device
+    embeddings_np = np.load(shard_path / "embeddings.npy")
     embeddings_tensor = torch.tensor(embeddings_np, dtype=torch.float32, device=device)
-    t1 = time.time()
-    print(f"[TIMING] Loading embeddings took {t1 - t0:.4f} seconds")
 
-    print("Loading docstore...")
-    t0 = time.time()
-    with open(load_path / "docstore.pkl", "rb") as f:
+    with open(shard_path / "docstore.pkl", "rb") as f:
         docstore = pickle.load(f)
-    t1 = time.time()
-    print(f"[TIMING] Loading docstore took {t1 - t0:.4f} seconds")
-
-    print("Loading index_to_docstore_id...")
-    t0 = time.time()
-    with open(load_path / "index_to_docstore_id.pkl", "rb") as f:
+    with open(shard_path / "index_to_docstore_id.pkl", "rb") as f:
         index_to_docstore_id = pickle.load(f)
-    t1 = time.time()
-    print(f"[TIMING] Loading index_to_docstore_id took {t1 - t0:.4f} seconds")
 
-    vector_db = MyTorchVectorDatabase(embeddings_tensor, docstore, index_to_docstore_id, device=device)
-    return vector_db
+    return MyTorchVectorDatabase(embeddings_tensor, docstore, index_to_docstore_id, device=device)
 
 
 def load_nq_data(file_path: str, max_docs: int = None):
@@ -305,15 +280,20 @@ def load_nq_data(file_path: str, max_docs: int = None):
     return docs, questions
 
 
-def build_index():
+def build_index_shard():
+    # 1) 读取原始数据（还未分词）
     RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz")
+    total_docs = len(RAW_KNOWLEDGE_BASE)
+    print(f"[build_index_shard] Total docs: {total_docs}")
 
-    docs_processed = split_documents(
-        512,
-        RAW_KNOWLEDGE_BASE,
-        tokenizer_name=EMBEDDING_MODEL_NAME,
-    )
+    # 2) 计算每个 shard 需要处理多少原始文档
+    shard_count = 20
+    docs_per_shard = total_docs // shard_count + 1
 
+    shards_dir = Path("rag_data_torch_shard")
+    shards_dir.mkdir(parents=True, exist_ok=True)
+
+    # 初始化 Embedding
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-l6-v2",
         multi_process=True,
@@ -321,10 +301,45 @@ def build_index():
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    KNOWLEDGE_VECTOR_DATABASE = MyTorchVectorDatabase.from_documents(docs_processed, embedding_model, device="cpu")
-    save_vector_database(KNOWLEDGE_VECTOR_DATABASE, "rag_data_torch")
+    for i in range(shard_count):
+        start_idx = i * docs_per_shard
+        if start_idx >= total_docs:
+            break  # 防止越界
+        end_idx = min((i + 1) * docs_per_shard, total_docs)
 
-    save_data(RAW_KNOWLEDGE_BASE, questions, "rag_data_torch")
+        # 2.1) 从原始 KB 中取出当前分片(1/10)的文档
+        chunk_docs = RAW_KNOWLEDGE_BASE[start_idx:end_idx]
+        print(f"[build_index_shard] Shard {i}: docs {start_idx}..{end_idx} (size={len(chunk_docs)})")
+
+        # 2.2) 对这部分文档做多进程分词
+        splitted_docs = split_documents(
+            chunk_size=512,
+            knowledge_base=chunk_docs,
+            tokenizer_name=EMBEDDING_MODEL_NAME,
+            batch_size=100,
+        )
+        print(f"[build_index_shard] Shard {i} => splitted docs: {len(splitted_docs)}")
+
+        # 2.3) 构建向量数据库 (embedding + docstore)
+        vector_db_shard = MyTorchVectorDatabase.from_documents(splitted_docs, embedding_model, device="cpu")
+
+        # 2.4) 保存当前分片
+        shard_dir = shards_dir / f"shard_{i}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        save_vector_db_shard(vector_db_shard, shard_dir)
+
+        # 2.5) **删除内存中的 doc、embedding 等对象**
+        del chunk_docs
+        del splitted_docs
+        del vector_db_shard
+        # 如果有在 GPU 上分配内存，也可清理
+        torch.cuda.empty_cache()
+
+    # 3) 最后保存 questions.pkl（只需保存一次）
+    with open(shards_dir / "questions.pkl", "wb") as f:
+        pickle.dump(questions, f)
+
+    print("[build_index_shard] Done building all shards.")
 
 
 def print_gpu_memory_usage(step_name: str):
@@ -346,30 +361,48 @@ def save_data(docs, questions, save_path):
         pickle.dump(questions, f)
 
 
-def batch_similarity_search(vector_db: MyTorchVectorDatabase, queries, embedding_model, k=3):
+def batch_similarity_search_shard(shards_dir: Path, queries: List[str], embedding_model, device="cpu", k=3):
     """
-    给定一个向量数据库+查询字符串列表 queries，用embedding_model获取查询向量后，
-    通过vector_db.search拿到 Top K 相似文档
+    对多个分片做检索，再把结果合并，得到全局 top k
     """
-    # 1) 生成查询向量 (M, D) -> Torch Tensor
-    #  如果 embedding_model 返回 numpy，就手动转换
+    # 1) 先一次性生成查询向量
     query_embeddings_np = embedding_model.embed_documents(queries)  # shape (M, D)
-    query_embeddings_tensor = torch.tensor(query_embeddings_np, dtype=torch.float32)
+    query_embeddings_tensor = torch.tensor(query_embeddings_np, dtype=torch.float32, device=device)
+    M = len(queries)
 
-    # 2) 调用向量数据库的 search
-    distances, indices = vector_db.search(query_embeddings_tensor, k=k)
+    # 2) 找到所有 shard_x 目录
+    shard_paths = [p for p in shards_dir.iterdir() if p.is_dir() and p.name.startswith("shard_")]
+    shard_paths = sorted(shard_paths, key=lambda p: p.name)  # shard_0, shard_1, ...
 
-    # 3) 把检索到的文档拿出来
-    results = []
-    for i in range(len(queries)):
-        docs = []
-        for idx in indices[i]:
-            doc_id = vector_db.index_to_docstore_id[int(idx)]
-            doc = vector_db.docstore[doc_id]
-            docs.append(doc)
-        results.append(docs)
+    # 对每个 query，累计存储 (similarity, doc)
+    all_results = [[] for _ in range(M)]
 
-    return results
+    for spath in shard_paths:
+        # 加载该分片向量数据库
+        vector_db = load_vector_db_shard(spath, device=device)
+        print(len(vector_db.docstore), len(vector_db.index_to_docstore_id))
+        # 对该分片执行 search
+        distances, indices = vector_db.search(query_embeddings_tensor, k=k)
+
+        # 记录进候选
+        for i in range(M):
+            for j in range(k):
+                sim_score = distances[i][j]
+                idx_in_shard = int(indices[i][j])
+                doc_id = vector_db.index_to_docstore_id[idx_in_shard]
+                doc = vector_db.docstore[doc_id]
+                all_results[i].append((sim_score, doc))
+
+        # 如果数据特别多，可以此时 vector_db = None，del vector_db，强行释放显存
+
+    # 最后，对每个 query 的所有候选做全局排序取 top k
+    final_results = []
+    for i in range(M):
+        candidates = sorted(all_results[i], key=lambda x: x[0], reverse=True)
+        top_k_docs = [doc for (score, doc) in candidates[:k]]
+        final_results.append(top_k_docs)
+
+    return final_results
 
 
 def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_docs, max_new_tokens=500):
@@ -411,50 +444,45 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
     return all_responses
 
 
-def batch_query(queries, embedding_model, device="cuda", batch_size=32):
-    # 1) 加载自定义Torch向量数据库
-    vector_db = load_vector_database("rag_data_torch", device=device)
+def batch_query_shard(queries, embedding_model, device="cpu", k=3, batch_size=32):
+    shards_dir = Path("rag_data_torch_shard")
 
-    # 2) 加载语言模型 (放GPU或CPU)
-    READER_MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, device_map="cuda")
-    t1 = time.time()
-    print(f"[TIMING] Loading model took {t1 - t0:.4f} seconds")
+    # 加载或初始化你的语言模型
+    READER_MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
+    model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, device_map="auto")
     tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
 
     all_answers = []
     for i in range(0, len(queries), batch_size):
         batch_queries = queries[i : i + batch_size]
 
-        # 相似度检索
+        # 分片检索
         t0 = time.time()
-        batch_docs = batch_similarity_search(vector_db, batch_queries, embedding_model, k=3)
-        t1 = time.time()
-        print(f"[TIMING] Similarity search took {t1 - t0:.4f} seconds")
+        batch_docs_list = batch_similarity_search_shard(
+            shards_dir, batch_queries, embedding_model, device=device, k=k
+        )
+        # => List[List[Document]]
+        print(f"Batch {i} - Retrieval time: {time.time() - t0:.2f}s")
 
-        # 生成回答（略），调用 batch_generate_responses(...) 等
+        # 构造 Prompt + 生成回答
         t0 = time.time()
-        batch_responses = batch_generate_responses(model, tokenizer, batch_queries, batch_docs)
-        t1 = time.time()
-        print(f"[TIMING] Response generation took {t1 - t0:.4f} seconds")
+        batch_responses = batch_generate_responses(model, tokenizer, batch_queries, batch_docs_list)
+        print(f"Batch {i} - Generation time: {time.time() - t0:.2f}s")
 
-        # 整理输出
-        for q, resp, docs in zip(batch_queries, batch_responses, batch_docs):
-            all_answers.append({"query": q, "answer": resp, "context": "\n".join(doc.page_content for doc in docs)})
+        for q, resp, docs in zip(batch_queries, batch_responses, batch_docs_list):
+            all_answers.append({"query": q, "answer": resp, "context": "\n".join(d.page_content for d in docs)})
 
     return all_answers
 
 
 if __name__ == "__main__":
     # 第一次执行时：构建并保存索引
-    build_index()
+    # build_index_shard()
 
     # 推理时：
-    with open(Path("rag_data_torch") / "questions.pkl", "rb") as f:
+    with open(Path("rag_data_torch_shard") / "questions.pkl", "rb") as f:
         questions = pickle.load(f)
 
-    # 初始化Embedding
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-l6-v2",
         multi_process=True,
@@ -462,10 +490,8 @@ if __name__ == "__main__":
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # 选取若干问题做测试
     queries = [q["question"] for q in questions[:4]]
-
-    answers = batch_query(queries, embedding_model, device="cpu", batch_size=4)
+    answers = batch_query_shard(queries, embedding_model, device="cpu", k=3, batch_size=4)
 
     for i, result in enumerate(answers):
         print(f"Result {i + 1}: {result['answer']}")
