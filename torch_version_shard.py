@@ -282,12 +282,12 @@ def load_nq_data(file_path: str, max_docs: int = None):
 
 def build_index_shard():
     # 1) 读取原始数据（还未分词）
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz")
+    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=10)
     total_docs = len(RAW_KNOWLEDGE_BASE)
     print(f"[build_index_shard] Total docs: {total_docs}")
 
     # 2) 计算每个 shard 需要处理多少原始文档
-    shard_count = 20
+    shard_count = 1
     docs_per_shard = total_docs // shard_count + 1
 
     shards_dir = Path("rag_data_torch_shard")
@@ -412,7 +412,7 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
         tokenizer.pad_token_id = tokenizer.eos_token_id
     for query, retrieved_docs in zip(batch_queries, batch_retrieved_docs):
         retrieved_docs_text = [doc.page_content for doc in retrieved_docs]
-        context = "".join([f"Document {str(i)}:" + doc for i, doc in enumerate(retrieved_docs_text)])
+        context = " ".join(retrieved_docs_text)
 
         # 构造批量的 final_prompt
         final_prompt = f"""
@@ -433,8 +433,6 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
     outputs = model.generate(
         **inputs,
         do_sample=False,
-        temperature=0.2,
-        repetition_penalty=1.1,
         max_new_tokens=max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
     )
@@ -458,9 +456,7 @@ def batch_query_shard(queries, embedding_model, device="cpu", k=3, batch_size=32
 
         # 分片检索
         t0 = time.time()
-        batch_docs_list = batch_similarity_search_shard(
-            shards_dir, batch_queries, embedding_model, device=device, k=k
-        )
+        batch_docs_list = batch_similarity_search_shard(shards_dir, batch_queries, embedding_model, device=device, k=k)
         # => List[List[Document]]
         print(f"Batch {i} - Retrieval time: {time.time() - t0:.2f}s")
 
@@ -477,7 +473,7 @@ def batch_query_shard(queries, embedding_model, device="cpu", k=3, batch_size=32
 
 if __name__ == "__main__":
     # 第一次执行时：构建并保存索引
-    # build_index_shard()
+    build_index_shard()
 
     # 推理时：
     with open(Path("rag_data_torch_shard") / "questions.pkl", "rb") as f:

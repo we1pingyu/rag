@@ -1,7 +1,6 @@
 import time
 import warnings
 import pickle
-import faiss_version
 import torch
 import datasets
 import json
@@ -134,22 +133,25 @@ def load_knowledge_base(load_path):
         return pickle.load(f)
 
 
-def load_vector_db_shard_faiss(shard_path: str, embedding_model) -> FAISS:
+def load_vector_db_shard_faiss(shard_path: str, embedding_model, use_mmap=True) -> FAISS:
     """
-    从指定目录 shard_path 加载 FAISS 索引、docstore、index_to_docstore_id，
-    构建并返回一个 FAISS 对象（使用 langchain_community.vectorstores.FAISS）。
+    从指定 shard_path 加载 FAISS 索引（采用内存映射）、docstore 以及 index_to_docstore_id，
+    返回一个 FAISS 对象。
     """
     shard_path = Path(shard_path)
     print(f"[load_vector_db_shard_faiss] Loading shard from {shard_path} ...")
-    # 1) 读取 FAISS 索引
-    index = faiss_version.read_index(str(shard_path / "faiss.index"))
-    # 2) 读取 docstore
+
+    t0 = time.time()
+    io_flag = faiss.IO_FLAG_MMAP if use_mmap else 0
+    index = faiss.read_index(str(shard_path / "faiss.index"), io_flag)
+    t1 = time.time()
+    print(f"[load_vector_db_shard_faiss] Loaded FAISS index in {t1 - t0:.2f} seconds.")
+
     with open(shard_path / "docstore.pkl", "rb") as f:
         docstore = pickle.load(f)
-    # 3) 读取 index_to_docstore_id
     with open(shard_path / "index_to_docstore_id.pkl", "rb") as f:
         index_to_docstore_id = pickle.load(f)
-    # 4) 构造 FAISS 对象
+
     vector_db = FAISS(
         embedding_function=embedding_model.embed_query,
         index=index,
@@ -188,7 +190,7 @@ def build_index_shard_faiss():
     构建完一块后立刻保存到对应的子目录，并释放内存。
     """
     # 加载原始数据（可根据需要设定 max_docs）
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz")
+    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=1000)
     total_docs = len(RAW_KNOWLEDGE_BASE)
     print(f"[build_index_shard_faiss] Total docs: {total_docs}")
 
@@ -213,9 +215,7 @@ def build_index_shard_faiss():
             break
         end_idx = min((i + 1) * docs_per_shard, total_docs)
         chunk_docs = RAW_KNOWLEDGE_BASE[start_idx:end_idx]
-        print(
-            f"[build_index_shard_faiss] Shard {i}: processing docs {start_idx} to {end_idx} (size={len(chunk_docs)})"
-        )
+        print(f"[build_index_shard_faiss] Shard {i}: processing docs {start_idx} to {end_idx} (size={len(chunk_docs)})")
 
         # 对当前分片做多进程分词
         splitted_docs = split_documents(
@@ -263,43 +263,41 @@ def save_data(docs, questions, save_path):
         pickle.dump(questions, f)
 
 
-def batch_similarity_search_shard_faiss(shards_dir: str, queries: List[str], embedding_model, k=3):
+def batch_similarity_search_shard_faiss(shards_dir: str, queries: List[str], embedding_model, k=3, use_mmap=True):
     """
-    对指定目录下的所有分片进行检索，合并每个分片的 Top K 结果，最终返回全局 Top K。
-    返回值：List[List[Document]]，每个查询对应一个文档列表。
+    对指定目录下的所有分片进行检索，并合并每个分片的 Top K 候选，最终返回全局 Top K。
+    返回格式：List[List[Document]]，每个查询对应一个文档列表。
     """
     shards_dir = Path(shards_dir)
-    # 找到所有 shard_x 目录，排序保证顺序 shard_0, shard_1, ...
     shard_paths = sorted(
         [p for p in shards_dir.iterdir() if p.is_dir() and p.name.startswith("shard_")], key=lambda p: p.name
     )
     print(f"[batch_similarity_search_shard_faiss] Found {len(shard_paths)} shards.")
 
-    # 生成查询向量（假设 embed_documents 返回 numpy 数组或 list）
+    # 生成查询向量（假设 embedding_model.embed_documents 返回 numpy 数组或列表）
     query_embeddings = embedding_model.embed_documents(queries)
+    query_embeddings = np.array(query_embeddings, dtype=np.float32)
     if isinstance(query_embeddings, list):
         query_embeddings = np.array(query_embeddings)
     M = len(queries)
-    # 对每个查询，累计存储候选 (similarity, doc)
     all_candidates = [[] for _ in range(M)]
 
-    # 依次对每个 shard执行检索
-    for shard_path in shard_paths:
-        vector_db = load_vector_db_shard_faiss(str(shard_path), embedding_model)
-        print(f"[batch_similarity_search_shard_faiss] Searching in {shard_path.name} ...")
+    # 遍历每个分片进行检索
+    for spath in shard_paths:
+        vector_db = load_vector_db_shard_faiss(str(spath), embedding_model, use_mmap=use_mmap)
+        print(f"[batch_similarity_search_shard_faiss] Searching in {spath.name} ...")
         distances, indices = vector_db.index.search(query_embeddings, k)
         for i in range(M):
             for j in range(k):
                 idx = indices[i][j]
                 if idx != -1:
-                    # 注意：index_to_docstore_id 中存储的 doc_id 是字符串
                     doc_id = str(vector_db.index_to_docstore_id[idx])
-                    # 这里假设 docstore 是一个 dict，直接用 get() 获取文档
-                    doc = vector_db.docstore.get(doc_id)
+                    # 此处假设 docstore 是 dict 类型
+                    doc = vector_db.docstore.search(doc_id)
                     if doc is not None:
                         all_candidates[i].append((distances[i][j], doc))
-        del vector_db
-    # 对每个查询，合并所有候选后排序取前 k
+        del vector_db  # 释放分片资源
+    # 全局排序取每个查询的 Top K
     final_results = []
     for i in range(M):
         sorted_candidates = sorted(all_candidates[i], key=lambda x: x[0], reverse=True)
@@ -322,12 +320,13 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
         Use the following context to answer the question. Be as specific and relevant as possible.
         Question:{query}
         Context:{context}
+        Answer:
         """
         batch_prompts.append(final_prompt)
 
     # 批量 tokenization
     inputs = tokenizer(
-        batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=512, padding_side="left"
+        batch_prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=1024, padding_side="left"
     ).to(model.device)
     print(inputs["input_ids"].shape)
 
@@ -346,16 +345,15 @@ def batch_generate_responses(model, tokenizer, batch_queries, batch_retrieved_do
     return all_responses
 
 
-def batch_query_shard_faiss(queries: List[str], embedding_model, batch_size: int = 32):
+def batch_query_shard_faiss(queries: List[str], embedding_model, batch_size: int = 32, use_mmap=True):
     """
     使用分片化的 FAISS 索引进行批量查询：
-      - 依次加载每个 shard 进行检索，
-      - 合并各 shard 检索结果，
+      - 每个分片采用内存映射加载，
+      - 依次检索后合并结果，
       - 调用生成模型生成回答。
     """
     shards_dir = Path("rag_data_faiss_shard")
 
-    # Step 1: 加载语言模型和 tokenizer（例如 Llama）
     READER_MODEL_NAME = "meta-llama/Llama-3.2-3B"
     model = AutoModelForCausalLM.from_pretrained(READER_MODEL_NAME, device_map="cpu")
     tokenizer = AutoTokenizer.from_pretrained(READER_MODEL_NAME)
@@ -363,9 +361,9 @@ def batch_query_shard_faiss(queries: List[str], embedding_model, batch_size: int
     all_answers = []
     for i in range(0, len(queries), batch_size):
         batch_queries = queries[i : i + batch_size]
-        # 分片检索：合并各 shard 的结果
-        batch_docs = batch_similarity_search_shard_faiss(str(shards_dir), batch_queries, embedding_model, k=3)
-        # 构造 prompt 并生成回答（调用你已有的 batch_generate_responses）
+        batch_docs = batch_similarity_search_shard_faiss(
+            str(shards_dir), batch_queries, embedding_model, k=1, use_mmap=use_mmap
+        )
         batch_responses = batch_generate_responses(model, tokenizer, batch_queries, batch_docs)
         for q, resp, docs in zip(batch_queries, batch_responses, batch_docs):
             context = "\n".join(doc.page_content for doc in docs)
@@ -375,7 +373,7 @@ def batch_query_shard_faiss(queries: List[str], embedding_model, batch_size: int
 
 if __name__ == "__main__":
     # First time: build and save index
-    build_index_shard_faiss()
+    # build_index_shard_faiss()
 
     # 查询时：加载 questions，并使用分片检索
     with open(Path("rag_data_faiss_shard") / "questions.pkl", "rb") as f:
@@ -391,7 +389,7 @@ if __name__ == "__main__":
     # 例如查询前 4 个问题
     queries = [q["question"] for q in questions[:4]]
     print(f"Processing {len(queries)} queries using shard FAISS ...")
-    answers = batch_query_shard_faiss(queries, embedding_model, batch_size=4)
+    answers = batch_query_shard_faiss(queries, embedding_model, batch_size=4, use_mmap=False)
 
     for i, result in enumerate(answers):
         print(f"Result {i + 1}: {result['answer']}")
