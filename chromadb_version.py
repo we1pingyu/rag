@@ -3,19 +3,25 @@ import pickle
 import gzip
 import json
 import functools
+import warnings
+import chromadb
+import torch
+import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict
 from tqdm import tqdm
-from transformers import AutoTokenizer
+
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)  # Transformers 的部分警告属于 UserWarning
+warnings.filterwarnings("ignore", module="langchain")
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain.docstore.document import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-import chromadb
 from chromadb.config import Settings
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-import shutil
 
 # 全局常量
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -100,82 +106,105 @@ class EmbeddingFunctionWrapper:
         self.embedding_model = embedding_model
 
     def __call__(self, input):
-        if isinstance(input, str):
-            input = [input]
-        input = [text.replace("\n", " ") for text in input]
         return self.embedding_model.embed_documents(input)
 
 
 ####################################
 # 构建索引，并存储到 ChromaDB（Flat 索引，内存加载）
 ####################################
-def build_index(persist_directory: Optional[str] = None):
+def build_index(persist_directory: Optional[str] = None, num_shards: int = 10):
     """
-    Build and populate a ChromaDB index.
+    Build and populate a ChromaDB index using a specified number of shards.
 
     Args:
-        persist_directory: If provided, data will be persisted to this directory.
-                         If None, data will be stored in memory.
+        persist_directory: Directory for persistent storage
+        num_shards: Number of shards to split the data into
 
     Returns:
-        tuple: (client, collection, embedding_model)
+        tuple: (client, collection)
     """
+    # Clean existing directory if it exists
     if Path(persist_directory).exists():
         shutil.rmtree(persist_directory)
 
-    # 1. Load and process documents
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=10)
-    print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
+    # Create directory
+    Path(persist_directory).mkdir(parents=True, exist_ok=True)
 
-    docs_processed = split_documents(
-        chunk_size=512, knowledge_base=RAW_KNOWLEDGE_BASE, tokenizer_name=EMBEDDING_MODEL_NAME
+    # Initialize ChromaDB client
+    client = chromadb.PersistentClient(
+        path=persist_directory,
+        settings=Settings(anonymized_telemetry=False, allow_reset=True),
     )
-    print(f"After splitting, obtained {len(docs_processed)} document chunks.")
-    for doc in docs_processed:
-        print(f"Document: {doc.page_content}...")
+    print(f"Created persistent client with directory: {persist_directory}")
 
-    # 2. Initialize embedding model
+    # Initialize embedding model
     embedding_model = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
         multi_process=True,
         model_kwargs={"device": "cuda"},
-        encode_kwargs={"normalize_embeddings": True},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": 65536},
     )
-
     embedding_fn = EmbeddingFunctionWrapper(embedding_model)
 
-    # 3. Initialize ChromaDB client
-    if persist_directory:
-        Path(persist_directory).mkdir(parents=True, exist_ok=True)
-        client = chromadb.PersistentClient(path=persist_directory)
-        print(f"Created persistent client with directory: {persist_directory}")
-    else:
-        client = chromadb.Client()
-        print("Created in-memory client")
-
-    # 4. Create or get collection
+    # Create collection
     collection = client.get_or_create_collection(
         name="nq_collection",
         embedding_function=embedding_fn,
     )
 
-    # 5. Prepare data for insertion
-    texts = [doc.page_content for doc in docs_processed]
-    ids = [f"doc_{i}" for i in range(len(texts))]
-    metadatas = [doc.metadata for doc in docs_processed]
+    # Load all documents first
+    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz")
+    print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
 
-    # 6. Add documents to collection
-    batch_size = int(len(texts) / 10)  # Reduce batch size to avoid memory issues
-    for i in range(0, len(texts), batch_size):
-        end_idx = min(i + batch_size, len(texts))
-        collection.add(documents=texts[i:end_idx], metadatas=metadatas[i:end_idx], ids=ids[i:end_idx])
-        print(f"Added batch {i//batch_size + 1} of {(len(texts) + batch_size - 1)//batch_size}")
+    # Calculate documents per shard
+    total_docs = len(RAW_KNOWLEDGE_BASE)
+    docs_per_shard = (total_docs + num_shards - 1) // num_shards  # Round up division
+    print(f"Processing {total_docs} documents in {num_shards} shards ({docs_per_shard} docs per shard)")
 
-    print(f"Collection now has {collection.count()} documents.")
+    # Process each shard
+    for shard_idx in range(num_shards):
+        print(f"\nProcessing shard {shard_idx + 1}/{num_shards}")
 
-    # 7. Save questions
-    save_path = Path(persist_directory) if persist_directory else Path("in_memory_data")
-    save_path.mkdir(parents=True, exist_ok=True)
+        # Calculate shard document range
+        start_idx = shard_idx * docs_per_shard
+        if start_idx >= total_docs:
+            break  # Skip if we've processed all documents
+        end_idx = min((shard_idx + 1) * docs_per_shard, total_docs)
+
+        # Get documents for this shard
+        shard_docs = RAW_KNOWLEDGE_BASE[start_idx:end_idx]
+        print(f"Shard {shard_idx + 1}: Processing docs {start_idx}..{end_idx} (size={len(shard_docs)})")
+
+        # Process documents in this shard
+        docs_processed = split_documents(chunk_size=512, knowledge_base=shard_docs, tokenizer_name=EMBEDDING_MODEL_NAME)
+        print(f"Shard {shard_idx + 1}: split into {len(docs_processed)} chunks")
+
+        # Prepare data for insertion
+        texts = [doc.page_content for doc in docs_processed]
+        ids = [f"doc_{shard_idx}_{i}" for i in range(len(texts))]
+        # metadatas = [
+        #     {**doc.metadata, "shard_id": shard_idx, "original_doc_idx": f"{start_idx + i}"}
+        #     for i, doc in enumerate(docs_processed)
+        # ]
+
+        # Add documents to collection in smaller batches
+        batch_size = 5000  # Smaller batch size for better memory management
+        for i in tqdm(range(0, len(texts), batch_size), desc="Adding documents to collection"):
+            end_batch = min(i + batch_size, len(texts))
+            try:
+                collection.add(documents=texts[i:end_batch], metadatas=None, ids=ids[i:end_batch])
+            except Exception as e:
+                print(f"Error adding batch: {str(e)}")
+                continue
+
+        # Clean up this shard's data to free memory
+        del docs_processed, texts, ids
+        torch.cuda.empty_cache()
+
+        print(f"Completed shard {shard_idx + 1}, collection now has {collection.count()} documents")
+
+    # Save questions
+    save_path = Path(persist_directory)
     with open(save_path / "questions.pkl", "wb") as f:
         pickle.dump(questions, f)
     print(f"Saved questions to {save_path / 'questions.pkl'}")
@@ -215,7 +244,13 @@ def batch_query(embedding_model, batch_size: int = 4, persist_directory: str = "
 
         # Initialize embedding function and get collection
         embedding_fn = EmbeddingFunctionWrapper(embedding_model)
-        client = chromadb.PersistentClient(path=persist_directory)
+        client = chromadb.PersistentClient(
+            path=persist_directory,
+            settings=Settings(
+                anonymized_telemetry=False,  # 关闭遥测
+                allow_reset=True,  # 允许重置
+            ),
+        )
         try:
             collection = client.get_collection(name="nq_collection", embedding_function=embedding_fn)
         except Exception as e:

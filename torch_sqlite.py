@@ -333,7 +333,7 @@ def build_index_with_sqlite():
 
     # Initialize stores
     shards_dir = Path("rag_data_torch_sqlite")
-    clean_data_directory(shards_dir)
+    # clean_data_directory(shards_dir)
     shards_dir.mkdir(parents=True, exist_ok=True)
 
     doc_store = SQLiteDocumentStore(str(shards_dir / "documents.db"))
@@ -435,7 +435,10 @@ def batch_similarity_search_with_sqlite(
         top_k_doc_ids = [doc_id for (_, doc_id) in candidates[:k]]
 
         # Retrieve documents from SQLite
+        t0 = time.time()
         top_k_docs = doc_store.get_documents(top_k_doc_ids)
+        t1 = time.time()
+        print(f"Query {i} - Retrieval Doc time: {t1 - t0:.2f}s")
         final_results.append([doc.to_langchain() for doc in top_k_docs if doc])
 
     return final_results
@@ -516,7 +519,7 @@ def batch_query_with_sqlite(queries: List[str], embedding_model, device="cpu", k
 # Example usage
 if __name__ == "__main__":
     # First time: build index
-    build_index_with_sqlite()
+    # build_index_with_sqlite()
 
     # Query time
     shards_dir = Path("rag_data_torch_sqlite")
@@ -526,7 +529,7 @@ if __name__ == "__main__":
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-l6-v2",
         multi_process=True,
-        model_kwargs={"device": "cuda"},
+        model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
 
