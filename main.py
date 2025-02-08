@@ -20,6 +20,7 @@ warnings.filterwarnings("ignore", module="langchain")
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
+MAX_BATCH_SIZE = 4000000
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -50,7 +51,7 @@ if __name__ == "__main__":
             model_kwargs={"device": "cuda"},
             encode_kwargs={
                 "normalize_embeddings": True,
-                "batch_size": 65536,
+                "batch_size": MAX_BATCH_SIZE,
                 "show_progress_bar": True,
             },
         )
