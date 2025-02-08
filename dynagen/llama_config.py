@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=False)
 class LlamaConfig:
     name: str = "Llama-2-7b-hf"
     org: str = "meta-llama"

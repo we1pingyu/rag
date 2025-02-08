@@ -1118,6 +1118,7 @@ class OptLM:
         verbose: int = 0,
         evaluate: bool = False,
         profile_dir: str = None,
+        pad_token_id: int = 0,
     ):
         if evaluate:
             assert max_new_tokens == 1 and self.num_gpu_batches == 1 and self.policy.gpu_batch_size == 1
@@ -1138,7 +1139,7 @@ class OptLM:
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
-
+        self.config.pad_token_id = pad_token_id
         # Output token ids
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len), self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
