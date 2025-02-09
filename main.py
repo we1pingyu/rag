@@ -5,8 +5,9 @@ from pathlib import Path
 import pickle
 import random
 from pymilvus import connections, Collection
-from pipeline_manager import PipelineManager
+from pipeline import PipelineProcessor
 from baseline import BaselineProcessor
+from offline import OfflineProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model, build_qdrant_index
 from qdrant_client import QdrantClient
 
@@ -20,6 +21,7 @@ warnings.filterwarnings("ignore", module="langchain")
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
+
 MAX_BATCH_SIZE = 4000000
 
 # Global constants
@@ -33,13 +35,15 @@ if __name__ == "__main__":
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
     parser.add_argument("--cpu_memory_limit", type=int, default=64, help="CPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
-    parser.add_argument("--arrival_rate", type=float, default=16, help="Average number of questions arriving per minute")
+    parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions for index building")
     parser.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode")
     parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
     parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--offline", action="store_true", help="Run in offline mode")
+
     args = parser.parse_args()
     random.seed(args.seed)
     if args.build_index:
@@ -95,13 +99,16 @@ if __name__ == "__main__":
         model_name = "meta-llama/Llama-3.1-8B-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if args.dynagen:
+            os.environ["OMP_NUM_THREADS"] = "8"
+            os.environ["MKL_NUM_THREADS"] = "8"
+            os.environ["OPENBLAS_NUM_THREADS"] = "8"
             model = init_dynagen_model(model_name, tokenizer, args)
 
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
-                max_memory={0: "14GiB"},
+                # max_memory={0: "20GiB"},
             )
 
         # Load embedding model
@@ -123,7 +130,21 @@ if __name__ == "__main__":
             # random.shuffle(all_questions)
             partition_names = metadata["partition_names"]
 
-        if args.baseline:
+        if args.offline:
+            print("\nRunning in offline mode (batch processing)")
+            processor = OfflineProcessor(
+                questions=all_questions[: args.total_questions],
+                batch_size=args.batch_size,
+                embedding_model=embedding_model,
+                model=model,
+                tokenizer=tokenizer,
+                collection=client if args.qdrant else collection,
+                partition_names=partition_names,
+                resident_partitions=args.resident_partitions,
+                use_qdrant=args.qdrant,
+                dynagen=args.dynagen,
+            )
+        elif args.baseline:
             print("\nRunning in baseline (serial) mode")
             processor = BaselineProcessor(
                 questions=all_questions[: args.total_questions],
@@ -138,10 +159,11 @@ if __name__ == "__main__":
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
                 use_qdrant=args.qdrant,
+                dynagen=args.dynagen,
             )
         else:
             # Initialize pipeline manager
-            processor = PipelineManager(
+            processor = PipelineProcessor(
                 questions=all_questions[: args.total_questions],
                 batch_size=args.batch_size,
                 arrival_rate=args.arrival_rate,
@@ -154,12 +176,13 @@ if __name__ == "__main__":
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
                 use_qdrant=args.qdrant,
+                dynagen=args.dynagen,
             )
 
         print(f"\nStarting processing:")
         print(f"Total questions: {len(all_questions[:args.total_questions])}")
         print(f"Batch size: {args.batch_size}")
-        if not args.baseline:
+        if not args.offline:
             print(f"Average arrival rate: {args.arrival_rate} questions/minute")
             print(f"Expected duration: {processor.expected_duration:.2f} seconds")
 

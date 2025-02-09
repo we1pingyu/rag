@@ -214,7 +214,7 @@ class InputEmbed:
             donate[1] = False
         else:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
@@ -279,7 +279,7 @@ class OutputEmbed:
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
         else:
@@ -586,7 +586,7 @@ class SelfAttention:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(self.compute)
             else:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (w_q, donate[2]),
@@ -733,7 +733,7 @@ class MLP:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
         donate = [False] * 7
         h, donate[0] = hidden.val, True
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (wi, donate[1]),
@@ -836,8 +836,8 @@ class OptLM:
             parser.parse_args().computation_policy == "alter_stream"
             or parser.parse_args().computation_policy == "optimize"
         ):
-            self.stream_manager = ComputationStreamAlterManager(32)
-            self.cache_loader = CacheLoaderManager(32)
+            self.stream_manager = ComputationStreamAlterManager(4)
+            self.cache_loader = CacheLoaderManager(4)
 
         # Intermediate tensors
         # The following buffers store values used

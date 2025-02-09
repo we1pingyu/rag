@@ -14,7 +14,7 @@ from utils import (
 )
 
 
-class PipelineManager:
+class PipelineProcessor:
 
     def __init__(
         self,
@@ -30,6 +30,7 @@ class PipelineManager:
         resident_partitions: int = 0,
         base_time: float = None,
         use_qdrant: bool = False,
+        dynagen: bool = False,
         seed: int = 42,
     ):
         self.questions = [
@@ -63,6 +64,7 @@ class PipelineManager:
         self.all_results = []
         self.results_lock = Lock()
         self.use_qdrant = use_qdrant
+        self.dynagen = dynagen
 
     def _generate_arrival_times(self):
         """使用泊松分布生成问题到达时间"""
@@ -94,61 +96,55 @@ class PipelineManager:
                     batch = self.current_batch
                     self.current_batch = []
 
-                    try:
-                        # Execute query
-                        query_texts = [q.question_text for q in batch]
-                        questions_dict = [{"question": q.question_text, "doc_id": q.doc_id} for q in batch]
+                    # Execute query
+                    query_texts = [q.question_text for q in batch]
+                    questions_dict = [{"question": q.question_text, "doc_id": q.doc_id} for q in batch]
 
-                        # Embedding generation
-                        embed_start = time.time()
-                        query_embeddings = self.embedding_model.embed_documents(query_texts)
-                        log_timing(self.timing_stats, "embedding_time", time.time() - embed_start)
+                    # Embedding generation
+                    embed_start = time.time()
+                    query_embeddings = self.embedding_model.embed_documents(query_texts)
+                    log_timing(self.timing_stats, "embedding_time", time.time() - embed_start)
 
-                        # Query execution based on selected backend
-                        if self.use_qdrant:
-                            batch_results, updated_timing_stats = batch_query_qdrant(
-                                client=self.collection,
-                                questions=questions_dict,
-                                query_texts=query_texts,
-                                query_embeddings=query_embeddings,
-                                partition_names=self.partition_names,
-                                timing_stats=self.timing_stats,
-                                resident_partitions=self.resident_partitions,
-                            )
-                        else:
-                            batch_results, updated_timing_stats = batch_query(
-                                collection=self.collection,
-                                questions=questions_dict,
-                                query_texts=query_texts,
-                                query_embeddings=query_embeddings,
-                                partition_names=self.partition_names,
-                                timing_stats=self.timing_stats,
-                                resident_partitions=self.resident_partitions,
-                            )
-                        self.timing_stats.update(updated_timing_stats)
-
-                        # Place query results in queue
-                        batch_result = BatchResult(
-                            questions=batch, query_embeddings=query_embeddings, query_results=batch_results
+                    # Query execution based on selected backend
+                    if self.use_qdrant:
+                        batch_results, updated_timing_stats = batch_query_qdrant(
+                            client=self.collection,
+                            questions=questions_dict,
+                            query_texts=query_texts,
+                            query_embeddings=query_embeddings,
+                            partition_names=self.partition_names,
+                            timing_stats=self.timing_stats,
+                            resident_partitions=self.resident_partitions,
                         )
-                        self.query_queue.put(batch_result)
-                        print(f"Query completed for batch at {time.time() - self.base_time:.2f}s")
+                    else:
+                        batch_results, updated_timing_stats = batch_query(
+                            collection=self.collection,
+                            questions=questions_dict,
+                            query_texts=query_texts,
+                            query_embeddings=query_embeddings,
+                            partition_names=self.partition_names,
+                            timing_stats=self.timing_stats,
+                            resident_partitions=self.resident_partitions,
+                        )
+                    self.timing_stats.update(updated_timing_stats)
 
-                    except Exception as e:
-                        print(f"Error in query worker: {str(e)}")
+                    # Place query results in queue
+                    batch_result = BatchResult(
+                        questions=batch, query_embeddings=query_embeddings, query_results=batch_results
+                    )
+                    self.query_queue.put(batch_result)
+                    print(f"Query completed for batch at {time.time() - self.base_time:.2f}s")
+
 
     def _generation_worker(self):
         """Execute generation worker thread"""
         while not (
             self.stop_event.is_set() and self.query_queue.empty() and self.completed_batches >= self.total_batches
         ):
-            try:
-                batch_result = self.query_queue.get(timeout=1.0)  # Wait for new batch results
-            except:
-                continue
+            batch_result = self.query_queue.get(timeout=1.0)  # Wait for new batch results
+            
 
             with self.generation_lock:
-                # try:
                 # Execute generation
                 batch_responses, updated_timing_stats = batch_generate_responses(
                     model=self.model,
@@ -157,6 +153,7 @@ class PipelineManager:
                     max_new_tokens=128,
                     batch_size=len(batch_result.questions),
                     timing_stats=self.timing_stats,
+                    dynagen=self.dynagen,
                 )
                 self.timing_stats.update(updated_timing_stats)
 

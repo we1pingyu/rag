@@ -21,6 +21,7 @@ class BaselineProcessor:
         resident_partitions: int = 0,
         base_time: float = None,
         use_qdrant: bool = False,
+        dynagen: bool = False,
     ):
         self.questions = [
             Question(question_text=q["question"], doc_id=q["doc_id"], arrival_time=0.0) for q in questions
@@ -37,6 +38,7 @@ class BaselineProcessor:
         self.base_time = base_time or time.time()
         self.results = []
         self.use_qdrant = use_qdrant
+        self.dynagen = dynagen
 
         # 生成到达时间
         self._generate_arrival_times()
@@ -100,6 +102,7 @@ class BaselineProcessor:
             max_new_tokens=128,
             batch_size=len(batch),
             timing_stats=self.timing_stats,
+            dynagen=self.dynagen,
         )
         self.timing_stats.update(updated_timing_stats)
 

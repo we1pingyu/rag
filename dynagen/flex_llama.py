@@ -86,7 +86,7 @@ class LlamaInputEmbed(InputEmbed):
             donate[1] = False
         else:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((w_token, donate[2]),) = weight_read_buf.pop()
         else:
@@ -127,7 +127,7 @@ class LlamaOutputEmbed(OutputEmbed):
         donate = [False] * 3
         h, donate[0] = hidden.val, True
 
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_ln, donate[1]), (w_token, donate[2]) = weight_read_buf.pop()
         else:
@@ -229,7 +229,7 @@ class LlamaSelfAttention(SelfAttention):
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(compute)
             else:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (w_ln, donate[2]),
@@ -333,7 +333,7 @@ class LlamaMLP(MLP):
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
         donate = [False] * 5
         h, donate[0] = hidden.val, True
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((w_ln, donate[1]), (w_g, donate[2]), (w_u, donate[3]), (w_d, donate[4])) = weight_read_buf.pop()
         else:
@@ -404,8 +404,8 @@ class LlamaLM(OptLM):
         #     parser.parse_args().computation_policy == "alter_stream"
         #     or parser.parse_args().computation_policy == "optimize"
         # ):
-        self.stream_manager = ComputationStreamAlterManager(32)
-        self.cache_loader = CacheLoaderManager(32)
+        self.stream_manager = ComputationStreamAlterManager(4)
+        self.cache_loader = CacheLoaderManager(4)
 
         # Intermediate tensors
         # The following buffers store values used
@@ -426,6 +426,8 @@ class LlamaLM(OptLM):
 
         self.task = None
         self.init_all_weights()
+        global BLS
+        BLS = self.policy.num_gpu_batches * self.policy.gpu_batch_size
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np")))
@@ -622,14 +624,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
-    auto_pop = (
-        args.computation_policy == "default"
-        or (args.computation_policy == "alter_stream" and args.num_gpu_batches == 1)
-        or args.computation_policy == "optimize"
-    )
-    BLS = 0
-    if not args.computation_policy == "default":
-        BLS = args.num_gpu_batches * args.gpu_batch_size
+    # auto_pop = (
+    #     args.computation_policy == "default"
+    #     or (args.computation_policy == "alter_stream" and args.num_gpu_batches == 1)
+    #     or args.computation_policy == "optimize"
+    # )
+    # BLS = 0
+    # if not args.computation_policy == "default":
+    #     BLS = args.num_gpu_batches * args.gpu_batch_size
     assert len(args.percent) == 6
 
     run_flexgen(args)

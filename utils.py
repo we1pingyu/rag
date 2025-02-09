@@ -76,8 +76,8 @@ def init_dynagen_model(model_name, tokenizer, args):
         num_gpu_batches=1,
         w_gpu_percent=100,  # Store all weights on GPU
         w_cpu_percent=0,
-        cache_gpu_percent=100,  # Store all cache on GPU
-        cache_cpu_percent=0,
+        cache_gpu_percent=0,  # Store all cache on GPU
+        cache_cpu_percent=100,
         act_gpu_percent=100,  # Store all activations on GPU
         act_cpu_percent=0,
         overlap=True,
@@ -197,14 +197,11 @@ def get_milvus_memory_usage():
     total_rss = 0
     # 遍历所有进程
     for proc in psutil.process_iter(attrs=["pid", "cmdline", "memory_info"]):
-        try:
-            cmdline = proc.info["cmdline"]
-            # 判断命令行中是否包含 "milvus"（根据实际情况可以修改匹配条件）
-            if cmdline and "milvus run standalone" in " ".join(cmdline):
-                # memory_info().rss 返回单位为字节的常驻内存
-                total_rss += proc.info["memory_info"].rss
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+        cmdline = proc.info["cmdline"]
+        # 判断命令行中是否包含 "milvus"（根据实际情况可以修改匹配条件）
+        if cmdline and "milvus run standalone" in " ".join(cmdline):
+            # memory_info().rss 返回单位为字节的常驻内存
+            total_rss += proc.info["memory_info"].rss
     return total_rss / (1024**3)
 
 
@@ -294,15 +291,11 @@ def build_index(persist_directory: Optional[str] = None, num_partitions: int = 1
                 partition_ids[i:end_batch],
                 embeddings[i:end_batch],
             ]
-            try:
-                collection.insert(entities, partition_name=partition_name)
-            except Exception as e:
-                print(f"Error inserting batch into partition {partition_name}: {str(e)}")
-                continue
+            collection.insert(entities, partition_name=partition_name)
 
         # Clean up memory
         del docs_processed, texts, doc_ids, embeddings
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         print(f"Completed partition {partition_idx + 1}, collection now has {collection.num_entities} documents")
 
@@ -340,69 +333,64 @@ def batch_query(
     if timing_stats is None:
         timing_stats = {}
 
-    try:
-        aggregated_results = [[] for _ in range(len(query_texts))]
+    aggregated_results = [[] for _ in range(len(query_texts))]
 
-        # Track which partitions are already loaded
-        loaded_partitions = set()
+    # Track which partitions are already loaded
+    loaded_partitions = set()
 
-        # Pre-load resident partitions
-        if resident_partitions > 0:
-            resident_partition_names = partition_names[:resident_partitions]
+    # Pre-load resident partitions
+    if resident_partitions > 0:
+        resident_partition_names = partition_names[:resident_partitions]
+        load_start = time.time()
+        collection.load(partition_names=resident_partition_names)
+        loaded_partitions.update(resident_partition_names)
+        log_timing(timing_stats, "partition_load_time", time.time() - load_start)
+
+    # Process each partition
+    for partition_name in partition_names:
+        if partition_name not in loaded_partitions:
             load_start = time.time()
-            collection.load(partition_names=resident_partition_names)
-            loaded_partitions.update(resident_partition_names)
+            collection.load(partition_names=[partition_name])
             log_timing(timing_stats, "partition_load_time", time.time() - load_start)
 
-        # Process each partition
-        for partition_name in partition_names:
-            if partition_name not in loaded_partitions:
-                load_start = time.time()
-                collection.load(partition_names=[partition_name])
-                log_timing(timing_stats, "partition_load_time", time.time() - load_start)
+        search_start = time.time()
+        partition_search_results = collection.search(
+            data=query_embeddings,
+            anns_field="embedding",
+            param=search_params if search_params else {"metric_type": "IP"},
+            limit=3,
+            output_fields=["text", "doc_id"],
+            partition_names=[partition_name],
+        )
+        log_timing(timing_stats, "search_time", time.time() - search_start)
 
-            search_start = time.time()
-            partition_search_results = collection.search(
-                data=query_embeddings,
-                anns_field="embedding",
-                param=search_params if search_params else {"metric_type": "IP"},
-                limit=5,
-                output_fields=["text", "doc_id"],
-                partition_names=[partition_name],
-            )
-            log_timing(timing_stats, "search_time", time.time() - search_start)
+        if partition_name not in loaded_partitions and partition_name not in partition_names[:resident_partitions]:
+            collection.release(partition_names=[partition_name])
 
-            if partition_name not in loaded_partitions and partition_name not in partition_names[:resident_partitions]:
-                collection.release(partition_names=[partition_name])
+        for i, hits in enumerate(partition_search_results):
+            aggregated_results[i].extend(hits)
 
-            for i, hits in enumerate(partition_search_results):
-                aggregated_results[i].extend(hits)
-
-        results_start = time.time()
-        final_results = []
-        for idx, hits in enumerate(aggregated_results):
-            hits.sort(key=lambda x: x.distance, reverse=True)
-            top_hits = hits[:5]
-            docs = [hit.entity.get("text") for hit in top_hits]
-            context = " ".join(docs)
-            final_results.append(
-                {
-                    "query": query_texts[idx],
-                    "answer": context,
-                    "metadata": {
-                        "doc_ids": [hit.entity.get("doc_id") for hit in top_hits],
-                        "searched_partitions": partition_names,
-                    },
-                    "original_doc_id": questions[idx]["doc_id"],
-                    "num_docs_retrieved": len(docs),
-                }
-            )
-        log_timing(timing_stats, "result_processing_time", time.time() - results_start)
-        return final_results, timing_stats
-
-    except Exception as e:
-        print(f"Error in batch_query: {str(e)}")
-        raise
+    results_start = time.time()
+    final_results = []
+    for idx, hits in enumerate(aggregated_results):
+        hits.sort(key=lambda x: x.distance, reverse=True)
+        top_hits = hits[:3]
+        docs = [hit.entity.get("text") for hit in top_hits]
+        context = " ".join(docs)
+        final_results.append(
+            {
+                "query": query_texts[idx],
+                "answer": context,
+                "metadata": {
+                    "doc_ids": [hit.entity.get("doc_id") for hit in top_hits],
+                    "searched_partitions": partition_names,
+                },
+                "original_doc_id": questions[idx]["doc_id"],
+                "num_docs_retrieved": len(docs),
+            }
+        )
+    log_timing(timing_stats, "result_processing_time", time.time() - results_start)
+    return final_results, timing_stats
 
 
 def batch_generate_responses(
@@ -412,6 +400,7 @@ def batch_generate_responses(
     max_new_tokens: int = 500,
     batch_size: int = 4,
     timing_stats: Optional[Dict[str, List[float]]] = None,
+    dynagen: bool = False,
 ) -> List[Dict]:
     """生成批量回答"""
     if timing_stats is None:
@@ -437,13 +426,25 @@ def batch_generate_responses(
     for i in range(0, len(batch_prompts), batch_size):
         batch = batch_prompts[i : i + batch_size]
         tokenize_start = time.time()
-        inputs = tokenizer(
-            batch, return_tensors="pt", padding="max_length", truncation=True, max_length=2048, padding_side="left"
-        ).to(model.device)
+        if dynagen:
+            inputs = tokenizer(
+                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=2048, padding_side="left"
+            ).input_ids
+        else:
+            inputs = tokenizer(
+                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=2048, padding_side="left"
+            ).to(model.device)
         log_timing(timing_stats, "tokenization_time", time.time() - tokenize_start)
 
         generate_start = time.time()
-        with torch.no_grad():
+        if dynagen:
+            outputs = model.generate(
+                inputs,
+                do_sample=False,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        else:
             outputs = model.generate(
                 **inputs,
                 do_sample=False,
@@ -536,11 +537,7 @@ def build_qdrant_index(persist_directory: Optional[str] = None, num_partitions: 
                 )
             ]
 
-            try:
-                client.upsert(collection_name="nq_collection", points=points)
-            except Exception as e:
-                print(f"Error inserting batch into partition {partition_idx}: {str(e)}")
-                continue
+            client.upsert(collection_name="nq_collection", points=points)
 
         # Clean up memory
         del docs_processed, texts, doc_ids, embeddings
@@ -573,36 +570,31 @@ def batch_query_qdrant(
     if timing_stats is None:
         timing_stats = {}
 
-    try:
-        results_start = time.time()
-        final_results = []
+    results_start = time.time()
+    final_results = []
 
-        for idx, (query_embedding, query_text) in enumerate(zip(query_embeddings, query_texts)):
+    for idx, (query_embedding, query_text) in enumerate(zip(query_embeddings, query_texts)):
 
-            # Search across all partitions
-            search_results = client.search(
-                collection_name="nq_collection", query_vector=query_embedding, limit=5, with_payload=True
-            )
-            # Process results
-            docs = [hit.payload["text"] for hit in search_results]
-            context = " ".join(docs)
+        # Search across all partitions
+        search_results = client.search(
+            collection_name="nq_collection", query_vector=query_embedding, limit=5, with_payload=True
+        )
+        # Process results
+        docs = [hit.payload["text"] for hit in search_results]
+        context = " ".join(docs)
 
-            final_results.append(
-                {
-                    "query": query_text,
-                    "answer": context,
-                    "metadata": {
-                        "doc_ids": [hit.payload["doc_id"] for hit in search_results],
-                        "searched_partitions": partition_names,
-                    },
-                    "original_doc_id": questions[idx]["doc_id"],
-                    "num_docs_retrieved": len(docs),
-                }
-            )
+        final_results.append(
+            {
+                "query": query_text,
+                "answer": context,
+                "metadata": {
+                    "doc_ids": [hit.payload["doc_id"] for hit in search_results],
+                    "searched_partitions": partition_names,
+                },
+                "original_doc_id": questions[idx]["doc_id"],
+                "num_docs_retrieved": len(docs),
+            }
+        )
 
-        log_timing(timing_stats, "result_processing_time", time.time() - results_start)
-        return final_results, timing_stats
-
-    except Exception as e:
-        print(f"Error in batch_query_qdrant: {str(e)}")
-        raise
+    log_timing(timing_stats, "result_processing_time", time.time() - results_start)
+    return final_results, timing_stats
