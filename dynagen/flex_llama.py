@@ -23,7 +23,7 @@ from dynagen.pytorch_backend import (
     fix_recursive_import,
     DeviceType,
 )
-from dynagen.flex_opt import (
+from .flex_opt import (
     Policy,
     init_weight_list,
     InputEmbed,
@@ -34,8 +34,8 @@ from dynagen.flex_opt import (
     OptLM,
     get_filename,
 )
-from dynagen.timer import timers
-from dynagen.utils import (
+from .timers import timers
+from .utils import (
     ExecutionEnv,
     GB,
     ValueHolder,
@@ -49,7 +49,6 @@ from dynagen.utils import (
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-auto_pop = False
 
 
 class LlamaInputEmbed(InputEmbed):
@@ -76,7 +75,9 @@ class LlamaInputEmbed(InputEmbed):
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+    def forward(
+        self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
+    ):
         # Compute input embedding
         donate = [False] * 3
         h, donate[0] = hidden.val, True
@@ -123,7 +124,9 @@ class LlamaOutputEmbed(OutputEmbed):
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+    def forward(
+        self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
+    ):
         donate = [False] * 3
         h, donate[0] = hidden.val, True
 
@@ -182,7 +185,7 @@ class LlamaSelfAttention(SelfAttention):
         weight_read_buf,
         k,
     ):
-        global BLS
+        # global BLS
         w_ln, w_q, w_k, w_v, w_re, w_o = weight_home.val
         tensors = [w_ln, w_q, w_k, w_v, w_re, w_o]
         cpu_tensors = [(i, t) for i, t in enumerate(tensors) if t.device.device_type == DeviceType.CPU]
@@ -201,9 +204,9 @@ class LlamaSelfAttention(SelfAttention):
                     w_o.smart_copy(dst1),
                 )
             )
-            if cpu_tensors and BLS > 0:
-                weight_home.val[min_idx] = weight_read_buf.val[min_idx][0]
-                BLS -= 4
+            # if cpu_tensors and BLS > 0:
+            #     weight_home.val[min_idx] = weight_read_buf.val[min_idx][0]
+            #     BLS -= 4
 
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
@@ -330,7 +333,9 @@ class LlamaMLP(MLP):
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
 
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
+    def forward(
+        self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
+    ):
         donate = [False] * 5
         h, donate[0] = hidden.val, True
         if k == self.policy.num_gpu_batches - 1:
@@ -360,8 +365,7 @@ class LlamaLM(OptLM):
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        # self.computation_policy = ComputationPolicyOptimize()
-        self.computation_policy = ComputationPolicyImpl()
+        self.computation_policy = ComputationPolicyOptimize()
 
         layers = []
         layers.append(LlamaInputEmbed(self.config, self.env, self.policy))
@@ -426,8 +430,6 @@ class LlamaLM(OptLM):
 
         self.task = None
         self.init_all_weights()
-        global BLS
-        BLS = self.policy.num_gpu_batches * self.policy.gpu_batch_size
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np")))
@@ -446,14 +448,14 @@ def get_inputs(prompt_len, num_prompts, tokenizer, model, path):
         prompts = [prompts[0][: int(prompt_len * 2.5)]]
     else:
         prompts = [prompts[0][: int(prompt_len * 4)]]
-    input_ids = tokenizer(prompts, padding="max_length", max_length=prompt_len).input_ids
+    input_ids = tokenizer(prompts, padding="max_length", max_length=prompt_len, truncation=True).input_ids
     input_ids[0] = input_ids[0][:prompt_len]
     return (input_ids[0],) * num_prompts
 
 
 def run_flexgen(args):
     print(f"<run_flexgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, padding_side="left", use_fast=True)
     tokenizer.pad_token_id = tokenizer.eos_token_id
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
@@ -571,7 +573,7 @@ def run_flexgen(args):
 
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-chat-hf", help="The model name.")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="The model name.")
     parser.add_argument("--hf-token", type=str, help="The huggingface token for accessing gated repo.")
     parser.add_argument(
         "--path",
@@ -624,6 +626,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
+    import resource
+
+    # resource.setrlimit(resource.RLIMIT_AS, (int(56 * 1024**3), int(56 * 1024**3)))
     # auto_pop = (
     #     args.computation_policy == "default"
     #     or (args.computation_policy == "alter_stream" and args.num_gpu_batches == 1)

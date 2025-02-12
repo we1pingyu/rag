@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-from dynagen.utils import (
+from .utils import (
     GB,
     T,
     cpu_mem_stats,

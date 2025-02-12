@@ -10,7 +10,7 @@ from utils import (
     batch_query,
     batch_generate_responses,
     batch_query_qdrant,
-    build_qdrant_index,
+    print_memory_usage,
 )
 
 
@@ -45,7 +45,7 @@ class PipelineProcessor:
         self.partition_names = partition_names
         self.timing_stats = timing_stats
         self.resident_partitions = resident_partitions
-        self.base_time = base_time or time.time()
+        self.base_time = base_time
 
         # 队列和状态管理
         self.question_queue = Queue()
@@ -134,48 +134,48 @@ class PipelineProcessor:
                     )
                     self.query_queue.put(batch_result)
                     print(f"Query completed for batch at {time.time() - self.base_time:.2f}s")
-
+                    print_memory_usage("After query completion - ")
 
     def _generation_worker(self):
         """Execute generation worker thread"""
         while not (
             self.stop_event.is_set() and self.query_queue.empty() and self.completed_batches >= self.total_batches
         ):
-            batch_result = self.query_queue.get(timeout=1.0)  # Wait for new batch results
-            
+            try:
+                batch_result = self.query_queue.get(timeout=1.0)  # Wait for new batch results
+                print_memory_usage("Before generation - ")
+                with self.generation_lock:
+                    # Execute generation
+                    batch_responses, updated_timing_stats = batch_generate_responses(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        batch_results=batch_result.query_results,
+                        max_new_tokens=128,
+                        batch_size=len(batch_result.questions),
+                        timing_stats=self.timing_stats,
+                        dynagen=self.dynagen,
+                    )
+                    self.timing_stats.update(updated_timing_stats)
 
-            with self.generation_lock:
-                # Execute generation
-                batch_responses, updated_timing_stats = batch_generate_responses(
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    batch_results=batch_result.query_results,
-                    max_new_tokens=128,
-                    batch_size=len(batch_result.questions),
-                    timing_stats=self.timing_stats,
-                    dynagen=self.dynagen,
-                )
-                self.timing_stats.update(updated_timing_stats)
+                    batch_result.generation_results = batch_responses
+                    self.completed_batches += 1
 
-                batch_result.generation_results = batch_responses
-                self.completed_batches += 1
+                    with self.results_lock:
+                        for q, r in zip(batch_result.questions, batch_responses):
+                            self.all_results.append(
+                                {
+                                    "question": q,
+                                    "result": r,
+                                    "arrival_time": q.arrival_time,
+                                    "completion_time": time.time(),
+                                }
+                            )
 
-                with self.results_lock:
-                    for q, r in zip(batch_result.questions, batch_responses):
-                        self.all_results.append(
-                            {
-                                "question": q,
-                                "result": r,
-                                "arrival_time": q.arrival_time,
-                                "completion_time": time.time(),
-                            }
-                        )
-
-                print(f"Generation completed for batch at {time.time() - self.base_time:.2f}s")
-                print(f"Completed {self.completed_batches}/{self.total_batches} batches")
-
-            # except Exception as e:
-            #     print(f"Error in generation worker: {str(e)}")
+                    print(f"Generation completed for batch at {time.time() - self.base_time:.2f}s")
+                    print(f"Completed {self.completed_batches}/{self.total_batches} batches")
+                    print_memory_usage("After generation - ")
+            except Exception as e:
+                continue
 
     def get_sorted_results(self):
         """获取按问题到达时间排序的所有结果"""
@@ -195,7 +195,9 @@ class PipelineProcessor:
                 time.sleep(wait_time)
 
             self.question_queue.put(question)
-            print(f"Question arrived at {time.time() - self.base_time:.2f}s: {question.question_text[:50]}...")
+            print(
+                f"Question arrived at {question.arrival_time - self.base_time:.2f}s: {question.question_text[:50]}..."
+            )
 
     def run(self):
         """运行流水线处理"""

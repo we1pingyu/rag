@@ -22,6 +22,7 @@ class BaselineProcessor:
         base_time: float = None,
         use_qdrant: bool = False,
         dynagen: bool = False,
+        env=None,
     ):
         self.questions = [
             Question(question_text=q["question"], doc_id=q["doc_id"], arrival_time=0.0) for q in questions
@@ -35,10 +36,11 @@ class BaselineProcessor:
         self.partition_names = partition_names
         self.timing_stats = timing_stats
         self.resident_partitions = resident_partitions
-        self.base_time = base_time or time.time()
+        self.base_time = base_time
         self.results = []
         self.use_qdrant = use_qdrant
         self.dynagen = dynagen
+        self.env = env
 
         # 生成到达时间
         self._generate_arrival_times()
@@ -103,6 +105,7 @@ class BaselineProcessor:
             batch_size=len(batch),
             timing_stats=self.timing_stats,
             dynagen=self.dynagen,
+            env=self.env if self.dynagen else None,
         )
         self.timing_stats.update(updated_timing_stats)
 
@@ -132,7 +135,7 @@ class BaselineProcessor:
                 time.sleep(wait_time)
 
             current_batch.append(question)
-            print(f"Question arrived at {time.time() - self.base_time:.2f}s")
+            print(f"Question arrived at {question.arrival_time- self.base_time:.2f}s: {question.question_text[:50]}...")
 
             # 当积累了足够的问题或者是最后一批时处理batch
             if len(current_batch) >= self.batch_size or q_idx == len(self.questions) - 1:

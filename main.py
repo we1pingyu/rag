@@ -4,6 +4,7 @@ import resource
 from pathlib import Path
 import pickle
 import random
+import torch
 from pymilvus import connections, Collection
 from pipeline import PipelineProcessor
 from baseline import BaselineProcessor
@@ -29,11 +30,12 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
-    parser.add_argument("--batch_size", type=int, default=4, help="Number of questions to process per batch")
+    parser.add_argument("--batch_size", type=int, default=8, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="rag_data_milvus", help="Directory for persisted data")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=64, help="CPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=128, help="CPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
@@ -43,6 +45,14 @@ if __name__ == "__main__":
     parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--offline", action="store_true", help="Run in offline mode")
+    parser.add_argument(
+        "--percent",
+        nargs="+",
+        type=int,
+        default=[100, 0, 20, 80],
+        help="four numbers: percent of weight on GPU, weight on CPU, cache on GPU, cache on CPU",
+    )
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -51,7 +61,7 @@ if __name__ == "__main__":
         # 初始化embedding model用于构建索引
         embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            multi_process=True,
+            multi_process=False,
             model_kwargs={"device": "cuda"},
             encode_kwargs={
                 "normalize_embeddings": True,
@@ -96,25 +106,47 @@ if __name__ == "__main__":
                 print(f"Loaded {args.resident_partitions} resident partitions: {resident_partition_names}")
         print("Loading models and initializing...")
         # Load LLM
-        model_name = "meta-llama/Llama-3.1-8B-Instruct"
+        model_name = args.model
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         if args.dynagen:
-            os.environ["OMP_NUM_THREADS"] = "8"
-            os.environ["MKL_NUM_THREADS"] = "8"
-            os.environ["OPENBLAS_NUM_THREADS"] = "8"
-            model = init_dynagen_model(model_name, tokenizer, args)
-
+            # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            model, env = init_dynagen_model(model_name, tokenizer, args)
+            dummy_text = ["Hello world"] * args.batch_size  # Simple warmup text
+            dummy_input = tokenizer(
+                dummy_text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=2048,
+                padding_side="left",
+            ).input_ids
+            # Perform warmup
+            model.generate(
+                dummy_input,
+                do_sample=False,
+                max_new_tokens=1,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         else:
+            max_memory_per_batch = 1.5  # GiB per batch
+            total_memory = 24  # Total available memory in GiB
+
+            # Calculate remaining memory after accounting for batch size
+            max_memory_size = total_memory - (args.batch_size * max_memory_per_batch)
+
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
-                # max_memory={0: "20GiB"},
+                max_memory={0: f"{max_memory_size}GiB"},
             )
 
         # Load embedding model
         embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            multi_process=True,
+            multi_process=False,
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
@@ -160,6 +192,7 @@ if __name__ == "__main__":
                 base_time=total_start_time,
                 use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
+                env=env if args.dynagen else None,
             )
         else:
             # Initialize pipeline manager
@@ -226,3 +259,5 @@ if __name__ == "__main__":
         if not args.qdrant:
             collection.release()
             connections.disconnect("default")
+        if args.dynagen:
+            env.close_copy_threads()

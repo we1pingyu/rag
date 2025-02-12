@@ -12,13 +12,13 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
-from dynagen.computation_policy import get_computation_policy
-from dynagen.computation_policy_streams import ComputationStreams
-from dynagen.computation_policy_alter_stream import ComputationStreamAlterManager, CacheLoaderManager
+from .computation_policy import get_computation_policy
+from .computation_policy_streams import ComputationStreams
+from .computation_policy_alter_stream import ComputationStreamAlterManager, CacheLoaderManager
 
-from dynagen.compression import CompressionConfig
-from dynagen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from dynagen.pytorch_backend import (
+from .compression import CompressionConfig
+from .opt_config import OptConfig, get_opt_config, download_opt_weights
+from .pytorch_backend import (
     TorchDevice,
     TorchDisk,
     DeviceType,
@@ -26,8 +26,8 @@ from dynagen.pytorch_backend import (
     general_copy,
     fix_recursive_import,
 )
-from dynagen.timer import timers
-from dynagen.utils import (
+from .timers import timers
+from .utils import (
     Task,
     ExecutionEnv,
     GB,
@@ -214,7 +214,7 @@ class InputEmbed:
             donate[1] = False
         else:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        if k == self.policy.num_gpu_batches - 1:
+        if auto_pop and k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
@@ -279,7 +279,7 @@ class OutputEmbed:
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
-        if k == self.policy.num_gpu_batches - 1:
+        if auto_pop and k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
         else:
@@ -586,7 +586,7 @@ class SelfAttention:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(self.compute)
             else:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
-        if k == self.policy.num_gpu_batches - 1:
+        if auto_pop and k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (w_q, donate[2]),
@@ -733,7 +733,7 @@ class MLP:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
         donate = [False] * 7
         h, donate[0] = hidden.val, True
-        if k == self.policy.num_gpu_batches - 1:
+        if auto_pop and k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (wi, donate[1]),
@@ -836,8 +836,8 @@ class OptLM:
             parser.parse_args().computation_policy == "alter_stream"
             or parser.parse_args().computation_policy == "optimize"
         ):
-            self.stream_manager = ComputationStreamAlterManager(4)
-            self.cache_loader = CacheLoaderManager(4)
+            self.stream_manager = ComputationStreamAlterManager(32)
+            self.cache_loader = CacheLoaderManager(32)
 
         # Intermediate tensors
         # The following buffers store values used
@@ -1205,6 +1205,7 @@ class OptLM:
         if evaluate:
             return self.hidden[0][-1][0].val.data.detach().cpu()
 
+        torch.cuda.empty_cache()
         return self.output_ids
 
     def generation_loop_normal(self, evaluate):

@@ -11,3 +11,4 @@ logs/
 rag_data*/
 *.zst
 *.gz
+*.txt

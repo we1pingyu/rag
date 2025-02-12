@@ -21,23 +21,10 @@ from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from dynagen.compression import CompressionConfig
 from dynagen.llama_config import LlamaConfig, get_llama_config
-from dynagen.pytorch_backend import (
-    LlamaTorchDevice,
-    TorchDisk,
-    get_torch_mixed_device_mem_manager,
-    fix_recursive_import,
-    DeviceType,
-)
+from dynagen.pytorch_backend import LlamaTorchDevice, TorchDisk, get_torch_mixed_device_mem_manager
 from dynagen.flex_opt import Policy
 from dynagen.utils import ExecutionEnv, GB, str2bool
-from dynagen.flex_llama import (
-    LlamaInputEmbed,
-    LlamaOutputEmbed,
-    LlamaSelfAttention,
-    LlamaMLP,
-    LlamaTransformerLayer,
-    LlamaLM,
-)
+from dynagen.flex_llama import LlamaLM
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -55,10 +42,21 @@ MARKDOWN_SEPARATORS = [
 ]
 
 
-def l2_normalize(vec):
-    vec = np.array(vec)
-    norm = np.linalg.norm(vec)
-    return (vec / norm).tolist() if norm != 0 else vec
+def get_memory_usage() -> Dict[str, float]:
+    """Get current process memory usage in GB"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+
+    return {
+        "rss": memory_info.rss / (1024**3),  # Resident Set Size in GB
+        "vms": memory_info.vms / (1024**3),  # Virtual Memory Size in GB
+    }
+
+
+def print_memory_usage(prefix: str = "") -> None:
+    """Print current memory usage with optional prefix"""
+    memory_info = get_memory_usage()
+    print(f"{prefix}Memory Usage - RSS: {memory_info['rss']:.2f} GB, VMS: {memory_info['vms']:.2f} GB")
 
 
 def init_dynagen_model(model_name, tokenizer, args):
@@ -74,15 +72,15 @@ def init_dynagen_model(model_name, tokenizer, args):
     policy = Policy(
         gpu_batch_size=args.batch_size,
         num_gpu_batches=1,
-        w_gpu_percent=100,  # Store all weights on GPU
-        w_cpu_percent=0,
-        cache_gpu_percent=0,  # Store all cache on GPU
-        cache_cpu_percent=100,
+        w_gpu_percent=args.percent[0],  # Store all weights on GPU
+        w_cpu_percent=args.percent[1],
+        cache_gpu_percent=args.percent[2],  # Store all cache on GPU
+        cache_cpu_percent=args.percent[3],
         act_gpu_percent=100,  # Store all activations on GPU
         act_cpu_percent=0,
         overlap=True,
         sep_layer=True,
-        pin_weight=True,
+        pin_weight=False,
         cpu_cache_compute=False,
         attn_sparsity=1.0,
         compress_weight=False,
@@ -97,7 +95,7 @@ def init_dynagen_model(model_name, tokenizer, args):
     # Initialize LlamaLM model
     model = LlamaLM(config=llama_config, env=env, path="~/llama_weights", policy=policy)
 
-    return model
+    return model, env
 
 
 @dataclass
@@ -401,6 +399,7 @@ def batch_generate_responses(
     batch_size: int = 4,
     timing_stats: Optional[Dict[str, List[float]]] = None,
     dynagen: bool = False,
+    env=None,
 ) -> List[Dict]:
     """生成批量回答"""
     if timing_stats is None:
@@ -464,7 +463,8 @@ def batch_generate_responses(
     for result, response in zip(batch_results, all_responses):
         result["llm_response"] = response
     log_timing(timing_stats, "results_compilation_time", time.time() - compile_start)
-
+    # if dynagen:
+    #     env.close_copy_threads()
     return batch_results, timing_stats
 
 

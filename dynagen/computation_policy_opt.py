@@ -71,7 +71,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
             # this.load_weight(i, j + 1, 0)
             # this.load_cache(i,j+1,0)
             this.load_hidden(i, j, 0)
-            this.compute_layer(i, j, 0, cpu_delegation=1)
+            this.compute_layer(i, j, 0, cpu_delegation=None)
             if j == this.num_layers - 1:
                 this.sync()
             this.store_cache(i, j - 1, 0)
@@ -97,11 +97,11 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                         token = i + 1
                     if token >= this.execute_gen_len:
                         continue
-                    if layers_weights_sync[layer] is None and loading_weights <= 1:
+                    if layers_weights_sync[layer] is None and loading_weights <= 3:
                         f = this.cache_loader.load_cache(True, load_layer_weight, token, layer)
                         layers_weights_sync[layer] = f
-                    if layers_cache_sync[layer] is None and loading_caches <= 1:
-                        f = this.cache_loader.load_cache(True, load_layer_cache, token, layer, 0, 1)
+                    if layers_cache_sync[layer] is None and loading_caches <= 3:
+                        f = this.cache_loader.load_cache(True, load_layer_cache, token, layer, 0, 0)
                         layers_cache_sync[layer] = f
 
                 compute_layer(i, j, layers_weights_sync, layers_cache_sync)

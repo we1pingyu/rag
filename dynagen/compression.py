@@ -3,8 +3,8 @@ import dataclasses
 import torch
 import numpy as np
 
-from dynagen.pytorch_backend import TorchTensor, TorchDevice, DeviceType, general_copy, fix_recursive_import
-from dynagen.utils import np_dtype_to_torch_dtype
+from .pytorch_backend import TorchTensor, TorchDevice, DeviceType, general_copy, fix_recursive_import
+from .utils import np_dtype_to_torch_dtype
 
 
 @dataclasses.dataclass

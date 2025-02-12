@@ -1,5 +1,5 @@
 from .computation_policy_interface import *
-from .timer import timers
+from .timers import timers
 from tqdm import tqdm
 import numpy as np
 import torch
