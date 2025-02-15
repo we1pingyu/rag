@@ -15,16 +15,16 @@ from dataclasses import dataclass
 from langchain.docstore.document import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
-from pymilvus import Collection, utility, CollectionSchema, FieldSchema, DataType, connections
+from pymilvus import Collection, utility, CollectionSchema, FieldSchema, DataType, connections, Partition
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from dynagen.compression import CompressionConfig
 from dynagen.llama_config import LlamaConfig, get_llama_config
 from dynagen.pytorch_backend import LlamaTorchDevice, TorchDisk, get_torch_mixed_device_mem_manager
-from dynagen.flex_opt import Policy
+from dynagen.dynagen_opt import Policy
 from dynagen.utils import ExecutionEnv, GB, str2bool
-from dynagen.flex_llama import LlamaLM
+from dynagen.dynagen_llama import LlamaLM
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -60,15 +60,15 @@ def print_memory_usage(prefix: str = "") -> None:
 
 
 def init_dynagen_model(model_name, tokenizer, args):
-    """Initialize FlexGen Llama model with specified configuration"""
+    """Initialize dynagen Llama model with specified configuration"""
     gpu = LlamaTorchDevice("cuda:0")
     cpu = LlamaTorchDevice("cpu")
-    disk = TorchDisk("./flexgen_offload_dir")
+    disk = TorchDisk("./dynagen_offload_dir")
     env = ExecutionEnv(
         gpu=gpu, cpu=cpu, disk=disk, mixed=get_torch_mixed_device_mem_manager("default", [gpu, cpu, disk])
     )
 
-    # Configure FlexGen policy
+    # Configure dynagen policy
     policy = Policy(
         gpu_batch_size=args.batch_size,
         num_gpu_batches=1,
@@ -81,7 +81,7 @@ def init_dynagen_model(model_name, tokenizer, args):
         overlap=True,
         sep_layer=True,
         pin_weight=False,
-        cpu_cache_compute=False,
+        cpu_cache_compute=True,
         attn_sparsity=1.0,
         compress_weight=False,
         comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
@@ -95,7 +95,7 @@ def init_dynagen_model(model_name, tokenizer, args):
     # Initialize LlamaLM model
     model = LlamaLM(config=llama_config, env=env, path="~/llama_weights", policy=policy)
 
-    return model, env
+    return model, llama_config, env
 
 
 @dataclass
@@ -327,26 +327,16 @@ def batch_query(
     timing_stats: Optional[Dict[str, List[float]]] = None,
     resident_partitions: int = 0,
 ):
-    """执行批量查询"""
+    """Execute batch queries"""
     if timing_stats is None:
         timing_stats = {}
 
     aggregated_results = [[] for _ in range(len(query_texts))]
 
-    # Track which partitions are already loaded
-    loaded_partitions = set()
-
-    # Pre-load resident partitions
-    if resident_partitions > 0:
-        resident_partition_names = partition_names[:resident_partitions]
-        load_start = time.time()
-        collection.load(partition_names=resident_partition_names)
-        loaded_partitions.update(resident_partition_names)
-        log_timing(timing_stats, "partition_load_time", time.time() - load_start)
-
     # Process each partition
     for partition_name in partition_names:
-        if partition_name not in loaded_partitions:
+        # Only load if it's not a resident partition
+        if partition_name not in partition_names[:resident_partitions]:
             load_start = time.time()
             collection.load(partition_names=[partition_name])
             log_timing(timing_stats, "partition_load_time", time.time() - load_start)
@@ -362,8 +352,10 @@ def batch_query(
         )
         log_timing(timing_stats, "search_time", time.time() - search_start)
 
-        if partition_name not in loaded_partitions and partition_name not in partition_names[:resident_partitions]:
-            collection.release(partition_names=[partition_name])
+        # Release non-resident partitions after search
+        if partition_name not in partition_names[:resident_partitions]:
+            partition = Partition(collection, partition_name)
+            partition.release()
 
         for i, hits in enumerate(partition_search_results):
             aggregated_results[i].extend(hits)
@@ -388,6 +380,7 @@ def batch_query(
             }
         )
     log_timing(timing_stats, "result_processing_time", time.time() - results_start)
+
     return final_results, timing_stats
 
 

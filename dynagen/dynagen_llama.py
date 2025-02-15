@@ -6,12 +6,11 @@ python3 -m flexgen.flex_llama --model meta-llama/Llama-2-7b-chat-hf --gpu-batch-
 import os
 import torch
 import argparse
+import numpy as np
 from typing import Union
 from transformers import AutoTokenizer
 from dynagen.compression import CompressionConfig
 from dynagen.llama_config import LlamaConfig, get_llama_config, download_llama_weights
-from dynagen.computation_policy import get_computation_policy
-from dynagen.computation_policy_streams import ComputationStreams
 from dynagen.computation_policy_alter_stream import ComputationStreamAlterManager, CacheLoaderManager
 from dynagen.computation_policy_opt import ComputationPolicyOptimize
 from dynagen.computation_policy_default import ComputationPolicyImpl
@@ -23,16 +22,16 @@ from dynagen.pytorch_backend import (
     fix_recursive_import,
     DeviceType,
 )
-from .flex_opt import (
+from .dynagen_opt import (
     Policy,
     init_weight_list,
     InputEmbed,
     OutputEmbed,
     SelfAttention,
     MLP,
-    TransformerLayer,
     OptLM,
     get_filename,
+    get_choice,
 )
 from .timers import timers
 from .utils import (
@@ -50,6 +49,45 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
+cpu_deviate = 0
+
+
+def update_weight_list(weight_specs, policy, env):
+    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
+    dev_choices = [env.disk, env.cpu, env.gpu]
+    global cpu_deviate
+    sizes = [np.prod(spec[0]) for spec in weight_specs]
+    sizes_cumsum = np.cumsum(sizes)
+    devices = []
+    target_distribution = np.array(dev_percents) / 100.0 * sizes_cumsum[-1]
+    actual_distribution = np.array([0, 0, 0])
+    dev_percents[1] += cpu_deviate / sizes_cumsum[-1] * 100
+    dev_percents[2] -= cpu_deviate / sizes_cumsum[-1] * 100
+
+    for i in range(len(weight_specs)):
+        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
+        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
+        for j in range(len(dev_choices)):
+            if home == dev_choices[j]:
+                actual_distribution[j] += sizes[i]
+
+        shape = weight_specs[i][0]
+        if len(shape) < 2:
+            pin_memory = True
+            compress = False
+        else:
+            pin_memory = policy.pin_weight
+            compress = policy.compress_weight
+
+        # Instead of creating and loading weights, just store the device info
+        if not compress:
+            devices.append(home)
+        else:
+            devices.append(home.compressed_device)
+
+    cpu_deviate += target_distribution[1] - actual_distribution[1]
+    return devices
+
 
 class LlamaInputEmbed(InputEmbed):
     def __init__(self, config, env, policy):
@@ -66,6 +104,23 @@ class LlamaInputEmbed(InputEmbed):
 
         weight_home.store(weights)
 
+    def update_weight(self, weight_home, path, w_gpu_percent, w_cpu_percent):
+        self.policy.w_gpu_percent = w_gpu_percent
+        self.policy.w_cpu_percent = w_cpu_percent
+        v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
+        path = os.path.join(path, "")
+        weight_specs = [
+            # w_token
+            ((v, h), dtype, path + "embed_tokens.weight"),
+        ]
+        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        old_weights = weight_home.val
+
+        for old_w, new_d in zip(old_weights, new_devices):
+            old_w.smart_copy(new_d)
+
+        weight_home.val = old_weights
+
     def load_weight(self, weight_home, weight_read_buf, k):
         (w_token,) = weight_home.val
         if k == 0:
@@ -81,7 +136,6 @@ class LlamaInputEmbed(InputEmbed):
         # Compute input embedding
         donate = [False] * 3
         h, donate[0] = hidden.val, True
-        # mask, donate[1] = attention_mask.val.smart_copy(self.compute)
         if isinstance(attention_mask, tuple):
             mask = attention_mask[1].val
             donate[1] = False
@@ -113,6 +167,25 @@ class LlamaOutputEmbed(OutputEmbed):
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
         weight_home.store(weights)
+
+    def update_weight(self, weight_home, path, w_gpu_percent, w_cpu_percent):
+        self.policy.w_gpu_percent = w_gpu_percent
+        self.policy.w_cpu_percent = w_cpu_percent
+        v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
+        path = os.path.join(path, "")
+        weight_specs = [
+            # w_ln
+            ((h,), dtype, path + "norm.weight"),
+            # w_token
+            ((v, h), dtype, path + "lm_head.weight"),
+        ]
+        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        old_weights = weight_home.val
+
+        for old_w, new_d in zip(old_weights, new_devices):
+            old_w.smart_copy(new_d)
+
+        weight_home.val = old_weights
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_ln, w_token = weight_home.val
@@ -179,18 +252,46 @@ class LlamaSelfAttention(SelfAttention):
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
+    def update_weight(self, weight_home, path, w_gpu_percent, w_cpu_percent):
+        self.policy.w_gpu_percent = w_gpu_percent
+        self.policy.w_cpu_percent = w_cpu_percent
+        h, n_head, n_kv_head, dtype = (
+            self.config.input_dim,
+            self.config.n_head,
+            self.config.num_key_value_heads,
+            self.config.dtype,
+        )
+        head_dim = h // n_head
+        path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
+        weight_specs = [
+            # w_ln
+            ((h,), dtype, path + "input_layernorm.weight"),
+            # w_q
+            ((h, n_head * head_dim), dtype, path + "self_attn.q_proj.weight"),
+            # w_k
+            ((n_kv_head * head_dim, h), dtype, path + "self_attn.k_proj.weight"),
+            # w_v
+            ((n_kv_head * head_dim, h), dtype, path + "self_attn.v_proj.weight"),
+            # w_re
+            ((head_dim // 2,), dtype, path + "self_attn.rotary_emb.inv_freq"),
+            # w_o
+            ((n_head * head_dim, h), dtype, path + "self_attn.o_proj.weight"),
+        ]
+        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        old_weights = weight_home.val
+
+        for old_w, new_d in zip(old_weights, new_devices):
+            old_w.smart_copy(new_d)
+
+        weight_home.val = old_weights
+
     def load_weight(
         self,
         weight_home,
         weight_read_buf,
         k,
     ):
-        # global BLS
         w_ln, w_q, w_k, w_v, w_re, w_o = weight_home.val
-        tensors = [w_ln, w_q, w_k, w_v, w_re, w_o]
-        cpu_tensors = [(i, t) for i, t in enumerate(tensors) if t.device.device_type == DeviceType.CPU]
-        if cpu_tensors:
-            min_idx, min_tensor = min(cpu_tensors, key=lambda x: x[1].bytes)
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
@@ -204,9 +305,6 @@ class LlamaSelfAttention(SelfAttention):
                     w_o.smart_copy(dst1),
                 )
             )
-            # if cpu_tensors and BLS > 0:
-            #     weight_home.val[min_idx] = weight_read_buf.val[min_idx][0]
-            #     BLS -= 4
 
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
@@ -246,7 +344,6 @@ class LlamaSelfAttention(SelfAttention):
             ((w_ln, _), (w_q, _), (w_k, _), (w_v, _), (w_re, _), (w_o, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
-            # mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             position_ids = torch.cumsum(mask_gpu.data, dim=1).int() * mask_gpu.data + 1
             h, new_k_cache, new_v_cache = compute.llama_mha(
                 h,
@@ -316,19 +413,37 @@ class LlamaMLP(MLP):
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
+    def update_weight(self, weight_home, path, w_gpu_percent, w_cpu_percent):
+        self.policy.w_gpu_percent = w_gpu_percent
+        self.policy.w_cpu_percent = w_cpu_percent
+        h, intermediate, dtype = (self.config.input_dim, self.config.intermediate_size, self.config.dtype)
+        path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
+        weight_specs = [
+            # w_ln
+            ((h,), dtype, path + "post_attention_layernorm.weight"),
+            # w_g
+            ((intermediate, h), dtype, path + "mlp.gate_proj.weight"),
+            # w_u
+            ((intermediate, h), dtype, path + "mlp.up_proj.weight"),
+            # w_d
+            ((h, intermediate), dtype, path + "mlp.down_proj.weight"),
+        ]
+        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        old_weights = weight_home.val
+
+        for old_w, new_d in zip(old_weights, new_devices):
+            old_w.smart_copy(new_d)
+
+        weight_home.val = old_weights
+
     def load_weight(self, weight_home, weight_read_buf, k):
         w_ln, w_g, w_u, w_d = weight_home.val
-        # tensors = [w_ln, w_g, w_u, w_d]
-        # cpu_tensors = [(i, t) for i, t in enumerate(tensors) if t.device.device_type == DeviceType.CPU]
-        # if cpu_tensors:
-        #     min_idx, min_tensor = min(cpu_tensors, key=lambda x: x[1].bytes)
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store(
                 (w_ln.smart_copy(dst2), w_g.smart_copy(dst1), w_u.smart_copy(dst1), w_d.smart_copy(dst1))
             )
-            # weight_home.val[min_idx] = weight_read_buf.val[min_idx][0]
 
     def pop_weight(self, weight_read_buf):
         weight_read_buf.pop()
@@ -348,14 +463,6 @@ class LlamaMLP(MLP):
         hidden.val = h
 
 
-class LlamaTransformerLayer(TransformerLayer):
-    def __init__(self, config, env, policy, i):
-        self.attention = LlamaSelfAttention(config, env, policy, i)
-        self.mlp = LlamaMLP(config, env, policy, i)
-        self.policy = policy
-        self.compute = self.attention.compute
-
-
 class LlamaLM(OptLM):
     def __init__(self, config: Union[str, LlamaConfig], env: ExecutionEnv, path: str, policy: Policy):
         if isinstance(config, str):
@@ -366,15 +473,13 @@ class LlamaLM(OptLM):
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
         self.computation_policy = ComputationPolicyOptimize()
+        # self.computation_policy = ComputationPolicyImpl()
 
         layers = []
         layers.append(LlamaInputEmbed(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
-            if policy.sep_layer:
-                layers.append(LlamaSelfAttention(self.config, self.env, self.policy, i))
-                layers.append(LlamaMLP(self.config, self.env, self.policy, i))
-            else:
-                layers.append(LlamaTransformerLayer(self.config, self.env, self.policy, i))
+            layers.append(LlamaSelfAttention(self.config, self.env, self.policy, i))
+            layers.append(LlamaMLP(self.config, self.env, self.policy, i))
         layers.append(LlamaOutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
@@ -402,12 +507,6 @@ class LlamaLM(OptLM):
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
         self.store_cache_stream = torch.cuda.Stream()
-        # if parser.parse_args().computation_policy == "stream":
-        #     self.stream_manager = ComputationStreams(self.policy.num_gpu_batches)
-        # elif (
-        #     parser.parse_args().computation_policy == "alter_stream"
-        #     or parser.parse_args().computation_policy == "optimize"
-        # ):
         self.stream_manager = ComputationStreamAlterManager(4)
         self.cache_loader = CacheLoaderManager(4)
 
@@ -438,6 +537,12 @@ class LlamaLM(OptLM):
             download_llama_weights(self.config.name, self.config.org, self.path, self.config.hf_token)
 
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
+
+    def update_weight(self, w_gpu_percent, w_cpu_percent):
+        global cpu_deviate
+        cpu_deviate = 0
+        for j in range(self.num_layers):
+            self.layers[j].update_weight(self.weight_home[j], self.path, w_gpu_percent, w_cpu_percent)
 
 
 def get_inputs(prompt_len, num_prompts, tokenizer, model, path):
@@ -626,17 +731,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
-    import resource
-
-    # resource.setrlimit(resource.RLIMIT_AS, (int(56 * 1024**3), int(56 * 1024**3)))
-    # auto_pop = (
-    #     args.computation_policy == "default"
-    #     or (args.computation_policy == "alter_stream" and args.num_gpu_batches == 1)
-    #     or args.computation_policy == "optimize"
-    # )
-    # BLS = 0
-    # if not args.computation_policy == "default":
-    #     BLS = args.num_gpu_batches * args.gpu_batch_size
     assert len(args.percent) == 6
 
     run_flexgen(args)

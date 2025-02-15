@@ -1,7 +1,7 @@
 import time
 from typing import List, Dict
 from tqdm import tqdm
-from utils import batch_query, batch_generate_responses, batch_query_qdrant
+from utils import batch_query, batch_generate_responses, batch_query_qdrant, Question
 
 
 class OfflineProcessor:
@@ -31,6 +31,7 @@ class OfflineProcessor:
         self.use_qdrant = use_qdrant
         self.dynagen = dynagen
         self.results = []
+        self.base_time = time.time()
 
         # 专门记录各阶段的时间
         self.timing_breakdown = {
@@ -44,6 +45,7 @@ class OfflineProcessor:
         }
 
     def _process_batch(self, batch: List[Dict]):
+        arrival_time = time.time()
         """处理单个batch并记录各阶段时间"""
         query_texts = [q["question"] for q in batch]
 
@@ -91,9 +93,24 @@ class OfflineProcessor:
         gen_time = time.time() - gen_start
         self.timing_breakdown["generation_times"].append(gen_time)
         self.timing_breakdown["generation_total"] += gen_time
-
+        completion_time = time.time()
         # 保存结果
-        self.results.extend(responses)
+        formatted_results = []
+        for i, response in enumerate(responses):
+            formatted_results.append(
+                {
+                    "question": Question(
+                        question_text=query_texts[i],
+                        doc_id=batch[i].get("doc_id", ""),
+                        arrival_time=arrival_time,
+                        batch_id=len(self.results) + i,
+                    ),
+                    "result": {"llm_response": response["llm_response"], "metadata": response["metadata"]},
+                    "arrival_time": arrival_time,
+                    "completion_time": completion_time,
+                }
+            )
+        self.results.extend(formatted_results)
 
         return responses
 
@@ -158,7 +175,7 @@ class OfflineProcessor:
             f"Percentage of Total: {(self.timing_breakdown['generation_total']/self.timing_breakdown['total_processing'])*100:.1f}%"
         )
 
-    def get_results(self):
+    def get_sorted_results(self):
         """获取所有处理结果"""
         return self.results
 

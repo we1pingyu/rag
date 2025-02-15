@@ -9,6 +9,8 @@ from pymilvus import connections, Collection
 from pipeline import PipelineProcessor
 from baseline import BaselineProcessor
 from offline import OfflineProcessor
+from dyn_offline import DynOfflineProcessor
+from active_profiling import ActiveProfilingProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model, build_qdrant_index
 from qdrant_client import QdrantClient
 
@@ -32,27 +34,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
-    parser.add_argument("--batch_size", type=int, default=8, help="Number of questions to process per batch")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="rag_data_milvus", help="Directory for persisted data")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=128, help="CPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=64, help="CPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
     parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions for index building")
-    parser.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode")
     parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
     parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode")
     parser.add_argument("--offline", action="store_true", help="Run in offline mode")
+    parser.add_argument("--dyn_offline", action="store_true", help="Run in offline mode with dynamic configuration")
+    parser.add_argument("--active", action="store_true", help="Run in active profiling mode")
     parser.add_argument(
         "--percent",
         nargs="+",
         type=int,
-        default=[100, 0, 20, 80],
-        help="four numbers: percent of weight on GPU, weight on CPU, cache on GPU, cache on CPU",
+        default=[100, 0, 100, 0],
+        help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -113,7 +117,7 @@ if __name__ == "__main__":
             tokenizer.pad_token_id = tokenizer.eos_token_id
         if args.dynagen:
             # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            model, env = init_dynagen_model(model_name, tokenizer, args)
+            model, model_config, env = init_dynagen_model(model_name, tokenizer, args)
             dummy_text = ["Hello world"] * args.batch_size  # Simple warmup text
             dummy_input = tokenizer(
                 dummy_text,
@@ -176,6 +180,38 @@ if __name__ == "__main__":
                 use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
             )
+        elif args.active:
+            processor = ActiveProfilingProcessor(
+                questions=all_questions,
+                embedding_model=embedding_model,
+                model=model,
+                tokenizer=tokenizer,
+                collection=collection,
+                partition_names=partition_names,
+                model_config=model_config,
+                dynagen=True,
+                env=env,
+                total_cpu_gb=args.cpu_memory_limit,
+                gpu_memory_gb=24,
+            )
+
+        elif args.dyn_offline:
+            print("\nRunning in offline mode with dynamic configuration")
+            processor = DynOfflineProcessor(
+                questions=all_questions[: args.total_questions],
+                batch_size=args.batch_size,
+                embedding_model=embedding_model,
+                model=model,
+                tokenizer=tokenizer,
+                collection=client if args.qdrant else collection,
+                partition_names=partition_names,
+                resident_partitions=args.resident_partitions,
+                use_qdrant=args.qdrant,
+                dynagen=args.dynagen,
+                cache_gpu_percent=args.percent[2],
+                cache_cpu_percent=args.percent[3],
+                env=env,
+            )
         elif args.baseline:
             print("\nRunning in baseline (serial) mode")
             processor = BaselineProcessor(
@@ -215,44 +251,72 @@ if __name__ == "__main__":
         print(f"\nStarting processing:")
         print(f"Total questions: {len(all_questions[:args.total_questions])}")
         print(f"Batch size: {args.batch_size}")
-        if not args.offline:
+        if not args.offline and not args.dyn_offline and not args.active:
             print(f"Average arrival rate: {args.arrival_rate} questions/minute")
             print(f"Expected duration: {processor.expected_duration:.2f} seconds")
 
         # Run pipeline
-        processor.run()
-        sorted_results = processor.get_sorted_results()
-        latency_stats = calculate_latency_stats(sorted_results)
+        if args.active:
+            optimal_configs = processor.run()
+        elif args.dyn_offline:
+            processor.run(
+                experiment_config=[
+                    {
+                        "batch_size": args.batch_size,
+                        "cache_gpu_percent": 80,
+                        "cache_cpu_percent": 20,
+                        "resident_partitions": 1,  # New parameter
+                    },
+                    {
+                        "batch_size": args.batch_size + 1,
+                        "cache_gpu_percent": 50,
+                        "cache_cpu_percent": 50,
+                        "resident_partitions": 2,  # Will release partitions 4 and 3
+                    },
+                    {
+                        "batch_size": args.batch_size + 2,
+                        "cache_gpu_percent": 0,
+                        "cache_cpu_percent": 20,
+                        "resident_partitions": 3,  # Will load partitions 6 and 5
+                    },
+                ]
+            )
+        else:
+            processor.run()
 
-        if args.display_results:
-            print("\nProcessed Results:")
-            print("=" * 80)
+        if not args.active:
             sorted_results = processor.get_sorted_results()
-            for idx, result in enumerate(sorted_results, 1):
-                print(f"\nQuestion {idx}/{len(sorted_results)}:")
-                print(f"Q: {result['question'].question_text}")
-                print(f"A: {result['result']['llm_response']}")
-                print(f"Retrieved Doc IDs: {result['result']['metadata']['doc_ids']}")
-                print(f"Arrival time: {result['arrival_time'] - processor .base_time:.2f}s")
-                print(f"Completion time: {result['completion_time'] - processor .base_time:.2f}s")
-                print(f"Processing time: {result['completion_time'] - result['arrival_time']:.2f}s")
-                print("-" * 40)
+            latency_stats = calculate_latency_stats(sorted_results)
 
-        print("\nLatency Statistics:")
-        print(f"Average Latency: {latency_stats['average_latency']:.2f} seconds")
-        print(f"90th Percentile Latency: {latency_stats['p90_latency']:.2f} seconds")
-        print(f"Maximum Latency: {latency_stats['max_latency']:.2f} seconds")
+            if args.display_results:
+                print("\nProcessed Results:")
+                print("=" * 80)
+                sorted_results = processor.get_sorted_results()
+                for idx, result in enumerate(sorted_results, 1):
+                    print(f"\nQuestion {idx}/{len(sorted_results)}:")
+                    print(f"Q: {result['question'].question_text}")
+                    print(f"A: {result['result']['llm_response']}")
+                    print(f"Retrieved Doc IDs: {result['result']['metadata']['doc_ids']}")
+                    print(f"Arrival time: {result['arrival_time'] - processor .base_time:.2f}s")
+                    print(f"Completion time: {result['completion_time'] - processor .base_time:.2f}s")
+                    print(f"Processing time: {result['completion_time'] - result['arrival_time']:.2f}s")
+                    print("-" * 40)
 
-        # Print final statistics
-        total_time = time.time() - total_start_time
-        # print("\nTiming Statistics:")
-        # category_totals = {}
-        # for key, times in timing_stats.items():
-        #     category_totals[key] = sum(times)
-        #     print(f"{key}:")
-        #     print(f"  Total time: {category_totals[key]:.3f}s")
-        #     print(f"  Percentage of total: {(category_totals[key]/total_time)*100:.1f}%")
-        print(f"\nTotal end-to-end time: {total_time:.3f}s")
+            print("\nLatency Statistics:")
+            print(f"Average Latency: {latency_stats['average_latency']:.2f} seconds")
+            print(f"90th Percentile Latency: {latency_stats['p90_latency']:.2f} seconds")
+            print(f"Maximum Latency: {latency_stats['max_latency']:.2f} seconds")
+
+            # Print final statistics
+            total_time = time.time() - total_start_time
+            # print("\nTiming Statistics:")
+            # category_totals = {}
+            # for key, times in timing_stats.items():
+            #     category_totals[key] = sum(times)
+            #     print(f"{key}:")
+            #     print(f"  Total time: {category_totals[key]:.3f}s")
+            #     print(f"  Percentage of total: {(category_totals[key]/total_time)*100:.1f}%")
+            print(f"\nTotal end-to-end time: {total_time:.3f}s")
 
     finally:
         print("\nCleaning up...")

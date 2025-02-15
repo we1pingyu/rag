@@ -46,7 +46,7 @@ fix_recursive_import()
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=False)
 class Policy:
     gpu_batch_size: int
     num_gpu_batches: int
@@ -156,7 +156,6 @@ def init_weight_list(weight_specs, policy, env):
     cpu_deviate += target_distribution[1] - actual_distribution[1]
     return ret
 
-
 class InputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -214,7 +213,7 @@ class InputEmbed:
             donate[1] = False
         else:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
         else:
@@ -279,7 +278,7 @@ class OutputEmbed:
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
         else:
@@ -336,12 +335,7 @@ class SelfAttention:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
-        global BLS
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
-        tensors = [w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln]
-        cpu_tensors = [(i, t) for i, t in enumerate(tensors) if t.device.device_type == DeviceType.CPU]
-        if cpu_tensors:
-            min_idx, min_tensor = min(cpu_tensors, key=lambda x: x[1].bytes)
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
@@ -359,9 +353,6 @@ class SelfAttention:
                     b_ln.smart_copy(dst2),
                 )
             )
-            if cpu_tensors and BLS > 0:
-                weight_home.val[min_idx] = weight_read_buf.val[min_idx][0]
-                BLS -= 4
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -586,7 +577,7 @@ class SelfAttention:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(self.compute)
             else:
                 mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (w_q, donate[2]),
@@ -615,7 +606,6 @@ class SelfAttention:
             ) = weight_read_buf.val
 
         if i == 0:  # prefill
-            # mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha(
                 h,
                 mask_gpu,
@@ -636,7 +626,6 @@ class SelfAttention:
             )
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
-            # mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen(
                 h,
@@ -733,7 +722,7 @@ class MLP:
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
         donate = [False] * 7
         h, donate[0] = hidden.val, True
-        if auto_pop and k == self.policy.num_gpu_batches - 1:
+        if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
                 (wi, donate[1]),
@@ -750,50 +739,6 @@ class MLP:
         hidden.val = h
 
 
-class TransformerLayer:
-    def __init__(self, config, env, policy, i):
-        self.attention = SelfAttention(config, env, policy, i)
-        self.mlp = MLP(config, env, policy, i)
-        self.policy = policy
-        self.compute = self.attention.compute
-
-    def set_task(self, task):
-        self.attention.set_task(task)
-        self.mlp.set_task(task)
-
-    def init_weight(self, weight_home, path):
-        home1, home2 = ValueHolder(), ValueHolder()
-        self.attention.init_weight(home1, path)
-        self.mlp.init_weight(home2, path)
-        weight_home.store((home1, home2))
-
-    def load_weight(self, weight_home, weight_read_buf, k):
-        read_buf1, read_buf2 = ValueHolder(), ValueHolder()
-        home1, home2 = weight_home.val
-        self.attention.load_weight(home1, read_buf1, k)
-        self.mlp.load_weight(home2, read_buf2, k)
-        if k == 0:
-            weight_read_buf.store((read_buf1, read_buf2))
-
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.attention.init_cache_one_gpu_batch(cache_home)
-
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
-
-    def store_cache(self, cache_home, cache_write_buf, i):
-        self.attention.store_cache(cache_home, cache_write_buf, i)
-
-    def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k):
-        if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
-        else:
-            read_buf1, read_buf2 = weight_read_buf.val
-
-        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask, cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
-
-
 class OptLM:
     def __init__(self, config: Union[str, OptConfig], env: ExecutionEnv, path: str, policy: Policy):
         if isinstance(config, str):
@@ -808,11 +753,8 @@ class OptLM:
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
         for i in range(self.config.num_hidden_layers):
-            if policy.sep_layer:
-                layers.append(SelfAttention(self.config, self.env, self.policy, i))
-                layers.append(MLP(self.config, self.env, self.policy, i))
-            else:
-                layers.append(TransformerLayer(self.config, self.env, self.policy, i))
+            layers.append(SelfAttention(self.config, self.env, self.policy, i))
+            layers.append(MLP(self.config, self.env, self.policy, i))
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
@@ -1064,9 +1006,11 @@ class OptLM:
         torch.cuda.synchronize()
 
     def init_all_weights(self):
+        global cpu_deviate
         self.weight_home = array_1d(self.num_layers, ValueHolder)
         for j in tqdm(range(self.num_layers)):
             self.init_weight(j)
+        cpu_deviate = 0
 
     def delete_all_weights(self):
         for j in range(self.num_layers):
@@ -1105,6 +1049,11 @@ class OptLM:
             val = attention_compute.allocate((self.policy.gpu_batch_size, self.task.prompt_len), bool)
             val.load_from_np((input_ids != self.config.pad_token_id))
             self.attention_mask_gpu[k].store(val)
+
+    def update_policy(self, cache_gpu_percent, cache_cpu_percent, gpu_batch_size):
+        self.policy.cache_gpu_percent = cache_gpu_percent
+        self.policy.cache_cpu_percent = cache_cpu_percent
+        self.policy.gpu_batch_size = gpu_batch_size
 
     def generate(
         self,
@@ -1437,14 +1386,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
-    auto_pop = (
-        args.computation_policy == "default"
-        or (args.computation_policy == "alter_stream" and args.num_gpu_batches == 1)
-        or args.computation_policy == "optimize"
-    )
-    BLS = 0
-    if not args.computation_policy == "default":
-        BLS = args.num_gpu_batches * args.gpu_batch_size
     assert len(args.percent) == 6
 
     run_flexgen(args)

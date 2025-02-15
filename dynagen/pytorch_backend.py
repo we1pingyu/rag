@@ -217,7 +217,7 @@ class TorchDevice:
 
             # We currently separate SelfAttention and MLP as two layers,
             # so we only need one workspace instead of two.
-            for i in range(max(16, policy.num_gpu_batches * 8) if policy.sep_layer else 2):
+            for i in range(4):
                 shape = (max_seq_len, b * n_head, head_dim)
                 k_cache = self.allocate(shape, np.float32, pin_memory=False)
                 v_cache = self.allocate(shape, np.float32, pin_memory=False)

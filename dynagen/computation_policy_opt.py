@@ -5,7 +5,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
-# from flexgen.optimize.dynagen_optimize import DynagenOpt, DynagenOptWorksetHeuristic
+# from dynagen.optimize.dynagen_optimize import DynagenOpt, DynagenOptWorksetHeuristic
 
 
 class MultiStreamBase:
@@ -67,7 +67,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
             if this.layers[j].need_cache:
                 wait_stream_finish(layers_cache_sync[j])
             layers_cache_sync[j] = None
-            cpu_del = j % 2 == 1
+            cpu_del = j % 4 == 1
             # this.load_weight(i, j + 1, 0)
             # this.load_cache(i,j+1,0)
             this.load_hidden(i, j, 0)
@@ -76,6 +76,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                 this.sync()
             this.store_cache(i, j - 1, 0)
             this.store_hidden(i, j, 0)
+            this.sync()
 
         layers_weights_sync = [None for _ in range(this.num_layers)]
         layers_cache_sync = [None for _ in range(this.num_layers)]
