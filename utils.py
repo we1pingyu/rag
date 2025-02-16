@@ -81,7 +81,7 @@ def init_dynagen_model(model_name, tokenizer, args):
         overlap=True,
         sep_layer=True,
         pin_weight=False,
-        cpu_cache_compute=True,
+        cpu_cache_compute=False,
         attn_sparsity=1.0,
         compress_weight=False,
         comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
@@ -334,7 +334,7 @@ def batch_query(
     aggregated_results = [[] for _ in range(len(query_texts))]
 
     # Process each partition
-    for partition_name in partition_names:
+    for partition_name in tqdm(partition_names, desc="Quering"):
         # Only load if it's not a resident partition
         if partition_name not in partition_names[:resident_partitions]:
             load_start = time.time()
@@ -391,7 +391,7 @@ def batch_generate_responses(
     max_new_tokens: int = 500,
     batch_size: int = 4,
     timing_stats: Optional[Dict[str, List[float]]] = None,
-    dynagen: bool = False,
+    dynagen: bool = True,
     env=None,
 ) -> List[Dict]:
     """生成批量回答"""
@@ -437,6 +437,7 @@ def batch_generate_responses(
                 pad_token_id=tokenizer.pad_token_id,
             )
         else:
+            print("Generating ...")
             outputs = model.generate(
                 **inputs,
                 do_sample=False,
@@ -444,6 +445,7 @@ def batch_generate_responses(
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
+            print("generation_time: ", time.time() - generate_start)
         log_timing(timing_stats, "generation_time", time.time() - generate_start)
 
         decode_start = time.time()

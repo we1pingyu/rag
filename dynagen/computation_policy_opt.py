@@ -1,10 +1,12 @@
 from .computation_policy_interface import *
+
 # from optimize.network_config import Llama13BConfig
 # from timer import timers
 from tqdm import tqdm
 import numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
+
 # from dynagen.optimize.dynagen_optimize import DynagenOpt, DynagenOptWorksetHeuristic
 
 
@@ -83,7 +85,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
         f = this.cache_loader.load_cache(True, load_layer_weight, 0, 0)
         layers_weights_sync[0] = f
         this.sync()
-        for i in tqdm(range(this.execute_gen_len)):
+        for i in tqdm(range(this.execute_gen_len), desc="Generating"):
             # timers("generate").start()
             this.update_attention_mask(i, 0)
             for j in range(this.num_layers):

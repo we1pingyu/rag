@@ -34,10 +34,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
-    parser.add_argument("--batch_size", type=int, default=4, help="Number of questions to process per batch")
+    parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="rag_data_milvus", help="Directory for persisted data")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
     parser.add_argument("--cpu_memory_limit", type=int, default=64, help="CPU memory limit in GB")
+    parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
@@ -53,13 +54,19 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[100, 0, 100, 0],
+        default=[40, 0, 20, 0],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     args = parser.parse_args()
     random.seed(args.seed)
+
+    total_gpu_memory = 24
+    fraction = args.gpu_memory_limit / total_gpu_memory
+    print(f"Setting GPU memory fraction to {fraction}")
+    torch.cuda.set_per_process_memory_fraction(0.5)
+
     if args.build_index:
         print("\nBuilding index...")
         # 初始化embedding model用于构建索引
@@ -116,7 +123,7 @@ if __name__ == "__main__":
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
         if args.dynagen:
-            # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            print("\nInitializing DynaGen model...")
             model, model_config, env = init_dynagen_model(model_name, tokenizer, args)
             dummy_text = ["Hello world"] * args.batch_size  # Simple warmup text
             dummy_input = tokenizer(
@@ -128,15 +135,17 @@ if __name__ == "__main__":
                 padding_side="left",
             ).input_ids
             # Perform warmup
-            model.generate(
-                dummy_input,
-                do_sample=False,
-                max_new_tokens=1,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            if not args.active:
+                model.generate(
+                    dummy_input,
+                    do_sample=False,
+                    max_new_tokens=1,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
         else:
+            print("\nInitializing HF model...")
             max_memory_per_batch = 1.5  # GiB per batch
-            total_memory = 24  # Total available memory in GiB
+            total_memory = args.gpu_memory_limit  # Total available memory in GiB
 
             # Calculate remaining memory after accounting for batch size
             max_memory_size = total_memory - (args.batch_size * max_memory_per_batch)
@@ -189,10 +198,8 @@ if __name__ == "__main__":
                 collection=collection,
                 partition_names=partition_names,
                 model_config=model_config,
-                dynagen=True,
-                env=env,
-                total_cpu_gb=args.cpu_memory_limit,
-                gpu_memory_gb=24,
+                total_cpu_gb=available_cpu_mem,
+                gpu_memory_gb=args.gpu_memory_limit,
             )
 
         elif args.dyn_offline:
@@ -248,9 +255,10 @@ if __name__ == "__main__":
                 dynagen=args.dynagen,
             )
 
-        print(f"\nStarting processing:")
-        print(f"Total questions: {len(all_questions[:args.total_questions])}")
-        print(f"Batch size: {args.batch_size}")
+        if not args.active:
+            print(f"\nStarting processing:")
+            print(f"Total questions: {len(all_questions[:args.total_questions])}")
+            print(f"Batch size: {args.batch_size}")
         if not args.offline and not args.dyn_offline and not args.active:
             print(f"Average arrival rate: {args.arrival_rate} questions/minute")
             print(f"Expected duration: {processor.expected_duration:.2f} seconds")

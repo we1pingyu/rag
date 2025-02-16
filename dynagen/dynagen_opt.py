@@ -1008,7 +1008,7 @@ class OptLM:
     def init_all_weights(self):
         global cpu_deviate
         self.weight_home = array_1d(self.num_layers, ValueHolder)
-        for j in tqdm(range(self.num_layers)):
+        for j in tqdm(range(self.num_layers), desc="Loading layers"):
             self.init_weight(j)
         cpu_deviate = 0
 
