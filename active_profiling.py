@@ -30,7 +30,7 @@ class ActiveProfilingProcessor:
         self.model = model
         self.tokenizer = tokenizer
         self.collection = collection
-        self.partition_names = partition_names
+        self.partition_names = ['partition_0']
         self.model_config = model_config
         self.total_cpu_gb = total_cpu_gb * safety_margin
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
@@ -188,7 +188,6 @@ class ActiveProfilingProcessor:
                 )
                 gen_time = time.time() - gen_start
 
-                print(generation_result)
                 if generation_result[1] == "timeout":
                     print(f"Generation timeout detected (>{timeout:.2f}s)")
                     return {"error": "cpu_oom"}
@@ -308,13 +307,13 @@ class ActiveProfilingProcessor:
             distribution["cache_cpu_percent"] = 0
 
         # Finally, use remaining CPU memory for resident partitions
-        distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
-
+        # distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
+        distribution["resident_partitions"] = 0
         return distribution
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling"""
-        batch_sizes = [8, 16, 32, 64]
+        batch_sizes = [2, 4, 8, 16, 32, 64]
         optimal_configs = []
         prev_best_max_time = float("inf")
 

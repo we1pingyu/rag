@@ -5,7 +5,7 @@ import pickle
 import psutil
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import functools
 from tqdm import tqdm
@@ -25,6 +25,7 @@ from dynagen.pytorch_backend import LlamaTorchDevice, TorchDisk, get_torch_mixed
 from dynagen.dynagen_opt import Policy
 from dynagen.utils import ExecutionEnv, GB, str2bool
 from dynagen.dynagen_llama import LlamaLM
+from datasets import load_dataset, get_dataset_split_names
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -158,7 +159,7 @@ def split_documents(
         return [doc for batch_result in results for doc in batch_result]
 
 
-def load_nq_data(file_path: str, max_docs: int = 1000):
+def load_nq(file_path: str, max_docs: int = 1000):
     """Load Natural Questions dataset"""
     docs = []
     questions = []
@@ -170,6 +171,126 @@ def load_nq_data(file_path: str, max_docs: int = 1000):
                 doc = json.loads(line)
                 docs.append(LangchainDocument(page_content=doc["document_text"], metadata={"source": f"nq_doc_{i}"}))
                 questions.append({"question": doc["question_text"] + "?", "doc_id": f"nq_doc_{i}"})
+    return docs, questions
+
+
+def load_marco(max_docs: int = None) -> Tuple[List[LangchainDocument], List[Dict]]:
+    configs = ["v2.1"]
+    docs = []
+    questions = []
+    doc_counter = 0
+
+    for config in configs:
+        print(f"\nLoading config: {config}")
+
+        # Get all splits for this configuration
+        splits = get_dataset_split_names("microsoft/ms_marco", config)
+        print(f"Found splits: {splits}")
+
+        for split in splits:
+            print(f"\nProcessing split: {split}")
+
+            # Load the dataset for this config and split
+            try:
+                dataset = load_dataset("microsoft/ms_marco", config, split=split)
+            except Exception as e:
+                print(f"Error loading {config}/{split}: {e}")
+                continue
+
+            # Create a progress bar for this split
+            iterator = tqdm(
+                enumerate(dataset),
+                total=len(dataset) if max_docs is None else min(max_docs - len(docs), len(dataset)),
+                desc=f"Loading {config}/{split}",
+            )
+
+            for i, example in iterator:
+                # Check if we've reached max_docs
+                if max_docs and len(docs) >= max_docs:
+                    print(f"Reached max_docs limit of {max_docs}")
+                    return docs, questions
+
+                if example["passages"]["passage_text"]:
+                    # Create a unique doc_id for each question
+                    doc_id = f"macro_doc_{doc_counter}"
+                    doc_counter += 1
+
+                    # Combine all search contexts into one document
+                    combined_context = " ".join(example["passages"]["passage_text"])
+                    # Create LangchainDocument
+                    doc = LangchainDocument(page_content=combined_context, metadata={"source": doc_id})
+                    docs.append(doc)
+                    # Store question with reference to doc_id
+                    questions.append({"question": example["query"], "doc_id": doc_id})
+
+    print(f"\nFinal dataset statistics:")
+    print(f"Total documents loaded: {len(docs)}")
+    print(f"Total questions loaded: {len(questions)}")
+    print(f"Documents per config:")
+    for config in configs:
+        config_docs = len([d for d in docs if d.metadata["config"] == config])
+        print(f"  {config}: {config_docs}")
+
+    return docs, questions
+
+
+def load_trivia(max_docs: int = 1000) -> Tuple[List[LangchainDocument], List[Dict]]:
+    configs = ["rc", "rc.web", "rc.wikipedia", "unfiltered"]
+    docs = []
+    questions = []
+    doc_counter = 0
+
+    for config in configs:
+        print(f"\nLoading config: {config}")
+
+        # Get all splits for this configuration
+        splits = get_dataset_split_names("mandarjoshi/trivia_qa", config)
+        print(f"Found splits: {splits}")
+
+        for split in splits:
+            print(f"\nProcessing split: {split}")
+
+            # Load the dataset for this config and split
+            try:
+                dataset = load_dataset("mandarjoshi/trivia_qa", config, split=split)
+            except Exception as e:
+                print(f"Error loading {config}/{split}: {e}")
+                continue
+
+            # Create a progress bar for this split
+            iterator = tqdm(
+                enumerate(dataset),
+                total=len(dataset) if max_docs is None else min(max_docs - len(docs), len(dataset)),
+                desc=f"Loading {config}/{split}",
+            )
+
+            for i, example in iterator:
+                # Check if we've reached max_docs
+                if max_docs and len(docs) >= max_docs:
+                    print(f"Reached max_docs limit of {max_docs}")
+                    return docs, questions
+
+                if example["search_results"]["search_context"]:
+                    # Create a unique doc_id for each question
+                    doc_id = f"trivia_doc_{doc_counter}"
+                    doc_counter += 1
+
+                    # Combine all search contexts into one document
+                    combined_context = " ".join(example["search_results"]["search_context"])
+                    # Create LangchainDocument
+                    doc = LangchainDocument(page_content=combined_context, metadata={"source": doc_id})
+                    docs.append(doc)
+                    # Store question with reference to doc_id
+                    questions.append({"question": example["question"], "doc_id": doc_id})
+
+    print(f"\nFinal dataset statistics:")
+    print(f"Total documents loaded: {len(docs)}")
+    print(f"Total questions loaded: {len(questions)}")
+    print(f"Documents per config:")
+    for config in configs:
+        config_docs = len([d for d in docs if d.metadata["config"] == config])
+        print(f"  {config}: {config_docs}")
+
     return docs, questions
 
 
@@ -224,12 +345,92 @@ def calculate_latency_stats(results):
     }
 
 
-def build_index(persist_directory: Optional[str] = None, num_partitions: int = 10, embedding_model=None):
+def merge_datasets(
+    nq_data: Tuple[List[LangchainDocument], List[Dict]], trivia_data: Tuple[List[LangchainDocument], List[Dict]]
+) -> Tuple[List[LangchainDocument], List[Dict]]:
+    """Merge Natural Questions and TriviaQA datasets.
+
+    Args:
+        nq_data: Tuple of (documents, questions) from load_nq_data
+        trivia_data: Tuple of (documents, questions) from load_trivia
+
+    Returns:
+        Tuple containing:
+        - List[LangchainDocument]: Combined list of documents
+        - List[Dict]: Combined list of questions with updated doc IDs
+    """
+    # Unpack input data
+    nq_docs, nq_questions = nq_data
+    trivia_docs, trivia_questions = trivia_data
+
+    # Initialize combined lists
+    combined_docs = []
+    combined_questions = []
+
+    print(f"Processing {len(nq_docs)} NQ documents and {len(trivia_docs)} TriviaQA documents")
+
+    # Add NQ documents and questions (keep original IDs)
+    combined_docs.extend(nq_docs)
+    combined_questions.extend(nq_questions)
+
+    # Create new IDs for TriviaQA documents to avoid conflicts
+    doc_id_mapping = {}
+
+    # Process TriviaQA documents
+    for i, doc in enumerate(trivia_docs):
+        old_doc_id = doc.metadata["source"]
+        new_doc_id = f"combined_trivia_doc_{i}"  # Create new unique ID
+        doc_id_mapping[old_doc_id] = new_doc_id
+
+        # Update document metadata
+        doc.metadata["source"] = new_doc_id
+        doc.metadata["original_dataset"] = "trivia_qa"
+        combined_docs.append(doc)
+
+    # Process TriviaQA questions and update doc_ids
+    for question in trivia_questions:
+        old_doc_id = question["doc_id"]
+        new_question = {
+            "question": question["question"],
+            "doc_id": doc_id_mapping[old_doc_id],
+            "original_dataset": "triviaqa",
+        }
+        combined_questions.append(new_question)
+
+    # Add dataset source information to NQ documents and questions
+    for doc in nq_docs:
+        doc.metadata["original_dataset"] = "natural_questions"
+
+    for question in nq_questions:
+        question["original_dataset"] = "natural_questions"
+
+    print(f"Combined dataset contains:")
+    print(f"- {len(combined_docs)} documents")
+    print(f"- {len(combined_questions)} questions")
+
+    # Verify all doc_ids in questions have corresponding documents
+    doc_ids = {doc.metadata["source"] for doc in combined_docs}
+    question_doc_ids = {q["doc_id"] for q in combined_questions}
+    missing_docs = question_doc_ids - doc_ids
+
+    if missing_docs:
+        print(f"Warning: Found {len(missing_docs)} questions with missing documents")
+
+    return combined_docs, combined_questions
+
+
+def build_index(
+    persist_directory: Optional[str] = None,
+    dataset: Optional[str] = None,
+    num_partitions: int = 10,
+    embedding_model=None,
+    max_docs: int = None,
+):
     """Build and populate a Milvus index with partitions"""
     # Connect to Milvus
     connections.connect(host="localhost", port="19530")
 
-    collection_name = "nq_collection"
+    collection_name = f"{dataset}_collection"
     if utility.has_collection(collection_name):
         utility.drop_collection(collection_name)
 
@@ -245,7 +446,16 @@ def build_index(persist_directory: Optional[str] = None, num_partitions: int = 1
     print(f"Created {num_partitions} partitions")
 
     # Load documents
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=None)
+    if dataset == "nq":
+        RAW_KNOWLEDGE_BASE, questions = load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs)
+    elif dataset == "trivia":
+        RAW_KNOWLEDGE_BASE, questions = load_trivia(max_docs=max_docs)
+    elif dataset == "macro":
+        RAW_KNOWLEDGE_BASE, questions = load_marco(max_docs=max_docs)
+    else:
+        RAW_KNOWLEDGE_BASE, questions = merge_datasets(
+            load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs), load_trivia(max_docs=max_docs)
+        )
     print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
 
     # Process documents in partitions
@@ -266,7 +476,7 @@ def build_index(persist_directory: Optional[str] = None, num_partitions: int = 1
 
         # Process documents
         docs_processed = split_documents(
-            chunk_size=512, knowledge_base=partition_docs, tokenizer_name=EMBEDDING_MODEL_NAME
+            chunk_size=256, knowledge_base=partition_docs, tokenizer_name=EMBEDDING_MODEL_NAME
         )
         print(f"Partition {partition_idx + 1}: split into {len(docs_processed)} chunks")
 
@@ -346,7 +556,7 @@ def batch_query(
             data=query_embeddings,
             anns_field="embedding",
             param=search_params if search_params else {"metric_type": "IP"},
-            limit=3,
+            limit=2,
             output_fields=["text", "doc_id"],
             partition_names=[partition_name],
         )
@@ -364,7 +574,7 @@ def batch_query(
     final_results = []
     for idx, hits in enumerate(aggregated_results):
         hits.sort(key=lambda x: x.distance, reverse=True)
-        top_hits = hits[:3]
+        top_hits = hits[:2]
         docs = [hit.entity.get("text") for hit in top_hits]
         context = " ".join(docs)
         final_results.append(
@@ -406,7 +616,7 @@ def batch_generate_responses(
     for result in batch_results:
         context = result["answer"] if result["answer"] else "No relevant context found."
         prompt = f"""
-        Use the following context to answer the question. If the context does not contain information relevant to the question, explicitly state that you cannot answer based on the provided context.
+        Answer the following question concisely using the provided context. If the context lacks relevant info, state that you cannot answer.
         Question: {result['query']}
         Context: {context}
         Answer:
@@ -420,11 +630,11 @@ def batch_generate_responses(
         tokenize_start = time.time()
         if dynagen:
             inputs = tokenizer(
-                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=2048, padding_side="left"
+                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=512, padding_side="left"
             ).input_ids
         else:
             inputs = tokenizer(
-                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=2048, padding_side="left"
+                batch, return_tensors="pt", padding="max_length", truncation=True, max_length=512, padding_side="left"
             ).to(model.device)
         log_timing(timing_stats, "tokenization_time", time.time() - tokenize_start)
 
@@ -481,7 +691,7 @@ def build_qdrant_index(persist_directory: Optional[str] = None, num_partitions: 
     print(f"Created Qdrant collection: nq_collection")
 
     # Load documents
-    RAW_KNOWLEDGE_BASE, questions = load_nq_data("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=None)
+    RAW_KNOWLEDGE_BASE, questions = load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=None)
     print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
 
     # Process documents in partitions

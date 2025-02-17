@@ -128,7 +128,7 @@ def init_weight_list(weight_specs, policy, env):
         shape, dtype, filename = weight_specs[i]
 
         if len(shape) < 2:
-            pin_memory = True
+            pin_memory = False
             compress = False
         else:
             pin_memory = policy.pin_weight

@@ -12,3 +12,4 @@ rag_data*/
 *.gz
 *.txt
 dynagen_offload_dir/
+*_data_*/

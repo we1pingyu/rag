@@ -193,7 +193,7 @@ class TorchDevice:
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         if self.device_type == DeviceType.CPU:
-            pin_memory = True if pin_memory is None else pin_memory
+            pin_memory = False if pin_memory is None else pin_memory
         else:
             pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]

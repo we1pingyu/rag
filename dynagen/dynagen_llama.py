@@ -73,10 +73,8 @@ def update_weight_list(weight_specs, policy, env):
 
         shape = weight_specs[i][0]
         if len(shape) < 2:
-            pin_memory = True
             compress = False
         else:
-            pin_memory = policy.pin_weight
             compress = policy.compress_weight
 
         # Instead of creating and loading weights, just store the device info
