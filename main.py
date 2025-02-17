@@ -37,7 +37,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="rag_data_milvus", help="Directory for persisted data")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=64, help="CPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=96, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
@@ -54,10 +54,10 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[40, 0, 20, 0],
+        default=[0, 100, 0, 100],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
-    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     args = parser.parse_args()
     random.seed(args.seed)
