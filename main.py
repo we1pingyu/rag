@@ -25,7 +25,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
 
-MAX_BATCH_SIZE = 4096
+MAX_BATCH_SIZE = 4000000
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -80,6 +80,7 @@ if __name__ == "__main__":
                 "batch_size": MAX_BATCH_SIZE,
             },
         )
+        embedding_model.show_progress = True
         if args.qdrant:
             client = build_qdrant_index(
                 persist_directory=args.persist_dir, num_partitions=args.num_partitions, embedding_model=embedding_model
