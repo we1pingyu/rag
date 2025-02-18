@@ -13,10 +13,11 @@ from dyn_offline import DynOfflineProcessor
 from active_profiling import ActiveProfilingProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model, build_qdrant_index
 from qdrant_client import QdrantClient
-
+import multiprocessing as mp
 import os
 import warnings
 
+mp.set_start_method("spawn", force=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,14 +26,14 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
 
-MAX_BATCH_SIZE = 4000000
+MAX_BATCH_SIZE = 8192
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-70B-Instruct", help="LLM Model name")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
@@ -63,24 +64,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     random.seed(args.seed)
 
-    total_gpu_memory = 24
-    fraction = args.gpu_memory_limit / total_gpu_memory
-    print(f"Setting GPU memory fraction to {fraction}")
-    torch.cuda.set_per_process_memory_fraction(fraction)
-
     if args.build_index:
         print("\nBuilding index...")
         # 初始化embedding model用于构建索引
         embedding_model = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            multi_process=False,
+            multi_process=True,
+            show_progress=True,
             model_kwargs={"device": "cuda"},
             encode_kwargs={
                 "normalize_embeddings": True,
                 "batch_size": MAX_BATCH_SIZE,
             },
         )
-        embedding_model.show_progress = True
         if args.qdrant:
             client = build_qdrant_index(
                 persist_directory=args.persist_dir, num_partitions=args.num_partitions, embedding_model=embedding_model
@@ -108,6 +104,11 @@ if __name__ == "__main__":
 
     try:
         if not args.qdrant:
+            total_gpu_memory = 24
+            fraction = args.gpu_memory_limit / total_gpu_memory
+            print(f"Setting GPU memory fraction to {fraction}")
+            torch.cuda.set_per_process_memory_fraction(fraction)
+
             collection.load(["partition_0"])
             print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
             available_cpu_mem = args.cpu_memory_limit - get_milvus_memory_usage() * (args.resident_partitions + 1)

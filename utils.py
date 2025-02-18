@@ -713,7 +713,7 @@ def build_qdrant_index(persist_directory: Optional[str] = None, num_partitions: 
 
         # Process documents
         docs_processed = split_documents(
-            chunk_size=512, knowledge_base=partition_docs, tokenizer_name=EMBEDDING_MODEL_NAME
+            chunk_size=256, knowledge_base=partition_docs, tokenizer_name=EMBEDDING_MODEL_NAME
         )
         print(f"Partition {partition_idx + 1}: split into {len(docs_processed)} chunks")
 
