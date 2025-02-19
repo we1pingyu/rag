@@ -23,21 +23,21 @@ class ActiveProfilingProcessor:
         model_config,
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
-        safety_margin: float = 0.8,
+        safety_margin: float = 0.9,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
         self.model = model
         self.tokenizer = tokenizer
         self.collection = collection
-        self.partition_names = ['partition_0']
+        self.partition_names = partition_names
         self.model_config = model_config
         self.total_cpu_gb = total_cpu_gb * safety_margin
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
         self.partition_size_gb = 9
         self.compute_space_per_batch = self.estimate_cache_size(1)  # GB per batch
         self.loaded_partitions = set()
-        self.prev_gen_time = 300
+        self.prev_gen_time = 3000
 
         # Get model requirements
         self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
@@ -96,7 +96,7 @@ class ActiveProfilingProcessor:
 
     def estimate_cache_size(self, batch_size: int) -> float:
         """Estimate cache size in GB for given batch size"""
-        return self.model_config.cache_bytes(batch_size, 1200) / (1024**3)
+        return self.model_config.cache_bytes(batch_size, 512) / (1024**3)
 
     def update_resident_partitions(self, new_resident_partitions: int):
         """Update number of resident partitions"""
@@ -182,7 +182,7 @@ class ActiveProfilingProcessor:
                     model=self.model,
                     tokenizer=self.tokenizer,
                     batch_results=batch_results,
-                    max_new_tokens=128,
+                    max_new_tokens=32,
                     batch_size=batch_size,
                     timeout=timeout,
                 )

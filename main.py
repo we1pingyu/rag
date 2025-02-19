@@ -17,7 +17,7 @@ import multiprocessing as mp
 import os
 import warnings
 
-mp.set_start_method("spawn", force=True)
+# mp.set_start_method("spawn", force=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -26,7 +26,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
 
-MAX_BATCH_SIZE = 8192
+MAX_BATCH_SIZE = 65536
 
 # Global constants
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
@@ -37,10 +37,10 @@ if __name__ == "__main__":
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
-    parser.add_argument("--dataset", type=str, default="nq", help="Dataset to use for rag: nq or trivia or macro")
+    parser.add_argument("--dataset", type=str, default="merge", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=256, help="CPU memory limit in GB")
-    parser.add_argument("--gpu_memory_limit", type=int, default=24, help="GPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=208, help="CPU memory limit in GB")
+    parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
@@ -56,7 +56,7 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[10, 90, 0, 100],
+        default=[5, 70, 0, 0],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
@@ -89,9 +89,6 @@ if __name__ == "__main__":
                 dataset=args.dataset,
             )
         print("Index building completed")
-
-    timing_stats = {}
-    total_start_time = time.time()
 
     if args.qdrant:
         print("Connecting to Qdrant...")
@@ -136,7 +133,7 @@ if __name__ == "__main__":
                 return_tensors="pt",
                 padding="max_length",
                 truncation=True,
-                max_length=2048,
+                max_length=512,
                 padding_side="left",
             ).input_ids
             # Perform warmup
@@ -180,7 +177,10 @@ if __name__ == "__main__":
             all_questions = metadata["questions"]
             # random.shuffle(all_questions)
             partition_names = metadata["partition_names"]
-
+        
+        
+        timing_stats = {}
+        total_start_time = time.time()
         if args.offline:
             print("\nRunning in offline mode (batch processing)")
             processor = OfflineProcessor(

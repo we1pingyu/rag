@@ -49,28 +49,17 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
-cpu_deviate = 0
-
 
 def update_weight_list(weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
-    global cpu_deviate
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
     devices = []
-    target_distribution = np.array(dev_percents) / 100.0 * sizes_cumsum[-1]
-    actual_distribution = np.array([0, 0, 0])
-    dev_percents[1] += cpu_deviate / sizes_cumsum[-1] * 100
-    dev_percents[2] -= cpu_deviate / sizes_cumsum[-1] * 100
 
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-        for j in range(len(dev_choices)):
-            if home == dev_choices[j]:
-                actual_distribution[j] += sizes[i]
-
         shape = weight_specs[i][0]
         if len(shape) < 2:
             compress = False
@@ -83,7 +72,6 @@ def update_weight_list(weight_specs, policy, env):
         else:
             devices.append(home.compressed_device)
 
-    cpu_deviate += target_distribution[1] - actual_distribution[1]
     return devices
 
 

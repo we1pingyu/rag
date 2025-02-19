@@ -11,6 +11,7 @@ import functools
 from tqdm import tqdm
 import torch
 import os
+import gc
 from dataclasses import dataclass
 from langchain.docstore.document import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -40,6 +41,12 @@ MARKDOWN_SEPARATORS = [
     "\n",
     " ",
     "",
+    "</p>",
+    "</div>",
+    "</section>",
+    "<br>",
+    "<br/>",
+    "\t",
 ]
 
 
@@ -121,9 +128,11 @@ class BatchResult:
 
 def process_doc_initializer(tokenizer_name, chunk_size):
     """初始化文档处理器"""
-    global text_splitter
+    global text_splitter, tokenizer
+    # 先加载 tokenizer，再创建 splitter
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-        AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True),
+        tokenizer,
         chunk_size=chunk_size,
         chunk_overlap=int(chunk_size / 10),
         add_start_index=True,
@@ -299,7 +308,7 @@ def create_milvus_collection(collection_name: str):
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=32),
-        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
+        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=10000),
         FieldSchema(name="partition_id", dtype=DataType.INT64),
         FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
     ]
@@ -424,7 +433,7 @@ def build_index(
     dataset: Optional[str] = None,
     num_partitions: int = 10,
     embedding_model=None,
-    max_docs: int = None,
+    max_docs: int = 1000,
 ):
     """Build and populate a Milvus index with partitions"""
     # Connect to Milvus
@@ -454,7 +463,7 @@ def build_index(
         RAW_KNOWLEDGE_BASE, questions = load_marco(max_docs=max_docs)
     else:
         RAW_KNOWLEDGE_BASE, questions = merge_datasets(
-            load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs), load_trivia(max_docs=max_docs)
+            load_trivia(max_docs=max_docs), load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs)
         )
     print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
 
@@ -487,7 +496,9 @@ def build_index(
 
         # Generate embeddings
         print(f"Generating embeddings for {len(texts)} documents ...")
+        start_time = time.time()
         embeddings = embedding_model.embed_documents(texts)
+        print(f"Embeddings generated in {time.time() - start_time:.2f} seconds")
 
         # Insert data in batches
         batch_size = 1000
@@ -503,6 +514,7 @@ def build_index(
 
         # Clean up memory
         del docs_processed, texts, doc_ids, embeddings
+        gc.collect()
         # torch.cuda.empty_cache()
 
         print(f"Completed partition {partition_idx + 1}, collection now has {collection.num_entities} documents")
@@ -549,6 +561,7 @@ def batch_query(
         if partition_name not in partition_names[:resident_partitions]:
             load_start = time.time()
             collection.load(partition_names=[partition_name])
+            print(f"Loaded partition {partition_name} {get_milvus_memory_usage():.2f} GB")
             log_timing(timing_stats, "partition_load_time", time.time() - load_start)
 
         search_start = time.time()
@@ -556,7 +569,7 @@ def batch_query(
             data=query_embeddings,
             anns_field="embedding",
             param=search_params if search_params else {"metric_type": "IP"},
-            limit=2,
+            limit=5,
             output_fields=["text", "doc_id"],
             partition_names=[partition_name],
         )
@@ -574,7 +587,7 @@ def batch_query(
     final_results = []
     for idx, hits in enumerate(aggregated_results):
         hits.sort(key=lambda x: x.distance, reverse=True)
-        top_hits = hits[:2]
+        top_hits = hits[:5]
         docs = [hit.entity.get("text") for hit in top_hits]
         context = " ".join(docs)
         final_results.append(
@@ -616,7 +629,8 @@ def batch_generate_responses(
     for result in batch_results:
         context = result["answer"] if result["answer"] else "No relevant context found."
         prompt = f"""
-        Answer the following question concisely using the provided context. If the context lacks relevant info, state that you cannot answer.
+        Answer the following question with a concise response (no more than 20 words) that directly uses the provided context. If the context lacks relevant information, state that you cannot answer.
+
         Question: {result['query']}
         Context: {context}
         Answer:
