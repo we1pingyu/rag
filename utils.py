@@ -3,28 +3,31 @@ import gzip
 import json
 import pickle
 import psutil
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor
-import functools
-from tqdm import tqdm
 import torch
 import os
 import gc
+import random
+import functools
+import numpy as np
+
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+
 from dataclasses import dataclass
 from langchain.docstore.document import Document as LangchainDocument
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from transformers import AutoTokenizer
 from pymilvus import Collection, utility, CollectionSchema, FieldSchema, DataType, connections, Partition
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from dynagen.compression import CompressionConfig
-from dynagen.llama_config import LlamaConfig, get_llama_config
+from dynagen.llama_config import get_llama_config
 from dynagen.pytorch_backend import LlamaTorchDevice, TorchDisk, get_torch_mixed_device_mem_manager
 from dynagen.dynagen_opt import Policy
-from dynagen.utils import ExecutionEnv, GB, str2bool
+from dynagen.utils import ExecutionEnv
 from dynagen.dynagen_llama import LlamaLM
 from datasets import load_dataset, get_dataset_split_names
 
@@ -41,12 +44,6 @@ MARKDOWN_SEPARATORS = [
     "\n",
     " ",
     "",
-    "</p>",
-    "</div>",
-    "</section>",
-    "<br>",
-    "<br/>",
-    "\t",
 ]
 
 
@@ -129,15 +126,13 @@ class BatchResult:
 def process_doc_initializer(tokenizer_name, chunk_size):
     """初始化文档处理器"""
     global text_splitter, tokenizer
-    # 先加载 tokenizer，再创建 splitter
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
         tokenizer,
         chunk_size=chunk_size,
-        chunk_overlap=int(chunk_size / 10),
-        add_start_index=True,
-        strip_whitespace=True,
+        # chunk_overlap=int(chunk_size / 10),
         separators=MARKDOWN_SEPARATORS,
+        is_separator_regex=True,
     )
 
 
@@ -235,10 +230,6 @@ def load_marco(max_docs: int = None) -> Tuple[List[LangchainDocument], List[Dict
     print(f"\nFinal dataset statistics:")
     print(f"Total documents loaded: {len(docs)}")
     print(f"Total questions loaded: {len(questions)}")
-    print(f"Documents per config:")
-    for config in configs:
-        config_docs = len([d for d in docs if d.metadata["config"] == config])
-        print(f"  {config}: {config_docs}")
 
     return docs, questions
 
@@ -295,10 +286,6 @@ def load_trivia(max_docs: int = 1000) -> Tuple[List[LangchainDocument], List[Dic
     print(f"\nFinal dataset statistics:")
     print(f"Total documents loaded: {len(docs)}")
     print(f"Total questions loaded: {len(questions)}")
-    print(f"Documents per config:")
-    for config in configs:
-        config_docs = len([d for d in docs if d.metadata["config"] == config])
-        print(f"  {config}: {config_docs}")
 
     return docs, questions
 
@@ -308,7 +295,7 @@ def create_milvus_collection(collection_name: str):
     fields = [
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=32),
-        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=10000),
+        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="partition_id", dtype=DataType.INT64),
         FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
     ]
@@ -354,86 +341,13 @@ def calculate_latency_stats(results):
     }
 
 
-def merge_datasets(
-    nq_data: Tuple[List[LangchainDocument], List[Dict]], trivia_data: Tuple[List[LangchainDocument], List[Dict]]
-) -> Tuple[List[LangchainDocument], List[Dict]]:
-    """Merge Natural Questions and TriviaQA datasets.
-
-    Args:
-        nq_data: Tuple of (documents, questions) from load_nq_data
-        trivia_data: Tuple of (documents, questions) from load_trivia
-
-    Returns:
-        Tuple containing:
-        - List[LangchainDocument]: Combined list of documents
-        - List[Dict]: Combined list of questions with updated doc IDs
-    """
-    # Unpack input data
-    nq_docs, nq_questions = nq_data
-    trivia_docs, trivia_questions = trivia_data
-
-    # Initialize combined lists
-    combined_docs = []
-    combined_questions = []
-
-    print(f"Processing {len(nq_docs)} NQ documents and {len(trivia_docs)} TriviaQA documents")
-
-    # Add NQ documents and questions (keep original IDs)
-    combined_docs.extend(nq_docs)
-    combined_questions.extend(nq_questions)
-
-    # Create new IDs for TriviaQA documents to avoid conflicts
-    doc_id_mapping = {}
-
-    # Process TriviaQA documents
-    for i, doc in enumerate(trivia_docs):
-        old_doc_id = doc.metadata["source"]
-        new_doc_id = f"combined_trivia_doc_{i}"  # Create new unique ID
-        doc_id_mapping[old_doc_id] = new_doc_id
-
-        # Update document metadata
-        doc.metadata["source"] = new_doc_id
-        doc.metadata["original_dataset"] = "trivia_qa"
-        combined_docs.append(doc)
-
-    # Process TriviaQA questions and update doc_ids
-    for question in trivia_questions:
-        old_doc_id = question["doc_id"]
-        new_question = {
-            "question": question["question"],
-            "doc_id": doc_id_mapping[old_doc_id],
-            "original_dataset": "triviaqa",
-        }
-        combined_questions.append(new_question)
-
-    # Add dataset source information to NQ documents and questions
-    for doc in nq_docs:
-        doc.metadata["original_dataset"] = "natural_questions"
-
-    for question in nq_questions:
-        question["original_dataset"] = "natural_questions"
-
-    print(f"Combined dataset contains:")
-    print(f"- {len(combined_docs)} documents")
-    print(f"- {len(combined_questions)} questions")
-
-    # Verify all doc_ids in questions have corresponding documents
-    doc_ids = {doc.metadata["source"] for doc in combined_docs}
-    question_doc_ids = {q["doc_id"] for q in combined_questions}
-    missing_docs = question_doc_ids - doc_ids
-
-    if missing_docs:
-        print(f"Warning: Found {len(missing_docs)} questions with missing documents")
-
-    return combined_docs, combined_questions
-
-
 def build_index(
     persist_directory: Optional[str] = None,
     dataset: Optional[str] = None,
     num_partitions: int = 10,
     embedding_model=None,
-    max_docs: int = 1000,
+    max_docs: int = None,
+    seed: int = 42,
 ):
     """Build and populate a Milvus index with partitions"""
     # Connect to Milvus
@@ -462,9 +376,14 @@ def build_index(
     elif dataset == "macro":
         RAW_KNOWLEDGE_BASE, questions = load_marco(max_docs=max_docs)
     else:
-        RAW_KNOWLEDGE_BASE, questions = merge_datasets(
-            load_trivia(max_docs=max_docs), load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs)
-        )
+        nq_docs, nq_questions = load_nq("v1.0-simplified_simplified-nq-train.jsonl.gz", max_docs=max_docs)
+        trivia_docs, trivia_questions = load_trivia(max_docs=max_docs)
+        RAW_KNOWLEDGE_BASE, questions = trivia_docs + nq_docs, trivia_questions + nq_questions
+    indices = list(range(len(RAW_KNOWLEDGE_BASE)))
+    random.seed(seed)
+    random.shuffle(indices)
+    RAW_KNOWLEDGE_BASE = [RAW_KNOWLEDGE_BASE[i] for i in indices]
+    questions = [questions[i] for i in indices]
     print(f"Loaded {len(RAW_KNOWLEDGE_BASE)} raw documents.")
 
     # Process documents in partitions

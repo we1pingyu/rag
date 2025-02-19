@@ -1,10 +1,12 @@
 import argparse
 import time
 import resource
-from pathlib import Path
 import pickle
 import random
 import torch
+import os
+import warnings
+from pathlib import Path
 from pymilvus import connections, Collection
 from pipeline import PipelineProcessor
 from baseline import BaselineProcessor
@@ -13,11 +15,8 @@ from dyn_offline import DynOfflineProcessor
 from active_profiling import ActiveProfilingProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model, build_qdrant_index
 from qdrant_client import QdrantClient
-import multiprocessing as mp
-import os
-import warnings
 
-# mp.set_start_method("spawn", force=True)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -44,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
-    parser.add_argument("--num_partitions", type=int, default=10, help="Number of partitions for index building")
+    parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")
     parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
     parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -177,8 +176,7 @@ if __name__ == "__main__":
             all_questions = metadata["questions"]
             # random.shuffle(all_questions)
             partition_names = metadata["partition_names"]
-        
-        
+
         timing_stats = {}
         total_start_time = time.time()
         if args.offline:
