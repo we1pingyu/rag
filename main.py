@@ -36,7 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
-    parser.add_argument("--dataset", type=str, default="merge", help="Dataset to use for rag: nq or trivia or macro")
+    parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
     parser.add_argument("--cpu_memory_limit", type=int, default=208, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")

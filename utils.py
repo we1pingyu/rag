@@ -105,8 +105,6 @@ def init_dynagen_model(model_name, tokenizer, args):
 
 @dataclass
 class Question:
-    """表示单个问题的数据类"""
-
     question_text: str
     doc_id: str
     arrival_time: float
@@ -115,8 +113,6 @@ class Question:
 
 @dataclass
 class BatchResult:
-    """表示一个批次的查询结果"""
-
     questions: List[Question]
     query_embeddings: Optional[torch.Tensor] = None
     query_results: Optional[List[Dict]] = None
@@ -124,20 +120,18 @@ class BatchResult:
 
 
 def process_doc_initializer(tokenizer_name, chunk_size):
-    """初始化文档处理器"""
     global text_splitter, tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-        tokenizer,
+    text_splitter = CharacterTextSplitter(
+        separator="",
         chunk_size=chunk_size,
-        # chunk_overlap=int(chunk_size / 10),
-        separators=MARKDOWN_SEPARATORS,
-        is_separator_regex=True,
+        chunk_overlap=int(chunk_size * 0.1),
+        length_function=len,
+        is_separator_regex=False,
     )
 
 
 def batch_process_docs(docs_batch):
-    """处理一批文档"""
     global text_splitter
     results = []
     for doc in docs_batch:
@@ -152,7 +146,7 @@ def split_documents(
     batch_size: int = 100,
 ) -> List[LangchainDocument]:
     """Split documents using multiprocessing"""
-    num_processes = os.cpu_count()  # 限制最大进程数
+    num_processes = os.cpu_count()
     process_doc_partial = functools.partial(batch_process_docs)
     batches = [knowledge_base[i : i + batch_size] for i in range(0, len(knowledge_base), batch_size)]
 
@@ -270,13 +264,26 @@ def load_trivia(max_docs: int = 1000) -> Tuple[List[LangchainDocument], List[Dic
                     print(f"Reached max_docs limit of {max_docs}")
                     return docs, questions
 
-                if example["search_results"]["search_context"]:
+                if example["search_results"]["search_context"] and config != "rc.wikipedia":
                     # Create a unique doc_id for each question
                     doc_id = f"trivia_doc_{doc_counter}"
                     doc_counter += 1
 
                     # Combine all search contexts into one document
                     combined_context = " ".join(example["search_results"]["search_context"])
+                    # Create LangchainDocument
+                    doc = LangchainDocument(page_content=combined_context, metadata={"source": doc_id})
+                    docs.append(doc)
+                    # Store question with reference to doc_id
+                    questions.append({"question": example["question"], "doc_id": doc_id})
+
+                elif example["entity_pages"]["wiki_context"] and config == "rc.wikipedia":
+                    # Create a unique doc_id for each question
+                    doc_id = f"trivia_doc_{doc_counter}"
+                    doc_counter += 1
+
+                    # Combine all search contexts into one document
+                    combined_context = " ".join(example["entity_pages"]["wiki_context"])
                     # Create LangchainDocument
                     doc = LangchainDocument(page_content=combined_context, metadata={"source": doc_id})
                     docs.append(doc)
@@ -310,25 +317,19 @@ def create_milvus_collection(collection_name: str):
 
 def get_milvus_memory_usage():
     total_rss = 0
-    # 遍历所有进程
     for proc in psutil.process_iter(attrs=["pid", "cmdline", "memory_info"]):
         cmdline = proc.info["cmdline"]
-        # 判断命令行中是否包含 "milvus"（根据实际情况可以修改匹配条件）
         if cmdline and "milvus run standalone" in " ".join(cmdline):
-            # memory_info().rss 返回单位为字节的常驻内存
             total_rss += proc.info["memory_info"].rss
     return total_rss / (1024**3)
 
 
 def calculate_latency_stats(results):
-    """计算延迟统计信息"""
-    # 计算每个查询的延迟
     latencies = []
     for result in results:
         latency = result["completion_time"] - result["arrival_time"]
         latencies.append(latency)
 
-    # 计算统计信息
     avg_latency = np.mean(latencies)
     p90_latency = np.percentile(latencies, 90)
     max_latency = np.max(latencies)
@@ -452,7 +453,6 @@ def build_index(
 
 
 def log_timing(timing_dict: Dict[str, List[float]], key: str, duration: float):
-    """记录时间信息"""
     if key not in timing_dict:
         timing_dict[key] = []
     timing_dict[key].append(duration)
@@ -536,7 +536,6 @@ def batch_generate_responses(
     dynagen: bool = True,
     env=None,
 ) -> List[Dict]:
-    """生成批量回答"""
     if timing_stats is None:
         timing_stats = {}
 
@@ -548,12 +547,11 @@ def batch_generate_responses(
     for result in batch_results:
         context = result["answer"] if result["answer"] else "No relevant context found."
         prompt = f"""
-        Answer the following question with a concise response (no more than 20 words) that directly uses the provided context. If the context lacks relevant information, state that you cannot answer.
+        Use ONLY information explicitly stated in the context. Do not add any external knowledge. Answer in max 20 words.
 
         Question: {result['query']}
         Context: {context}
-        Answer:
-        """
+        Answer: """
         batch_prompts.append(prompt)
     log_timing(timing_stats, "prompt_prep_time", time.time() - prep_start)
 
@@ -601,8 +599,6 @@ def batch_generate_responses(
     for result, response in zip(batch_results, all_responses):
         result["llm_response"] = response
     log_timing(timing_stats, "results_compilation_time", time.time() - compile_start)
-    # if dynagen:
-    #     env.close_copy_threads()
     return batch_results, timing_stats
 
 
