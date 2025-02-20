@@ -355,8 +355,8 @@ def build_index(
     connections.connect(host="localhost", port="19530")
 
     collection_name = f"{dataset}_collection"
-    if utility.has_collection(collection_name):
-        utility.drop_collection(collection_name)
+    # if utility.has_collection(collection_name):
+    #     utility.drop_collection(collection_name)
 
     collection = create_milvus_collection(collection_name)
     print(f"Created Milvus collection: {collection_name}")
