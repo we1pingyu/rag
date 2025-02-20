@@ -19,7 +19,16 @@ from dataclasses import dataclass
 from langchain.docstore.document import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from transformers import AutoTokenizer
-from pymilvus import Collection, utility, CollectionSchema, FieldSchema, DataType, connections, Partition
+from pymilvus import (
+    Collection,
+    utility,
+    CollectionSchema,
+    FieldSchema,
+    DataType,
+    connections,
+    Partition,
+    MilvusException,
+)
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
@@ -355,8 +364,12 @@ def build_index(
     connections.connect(host="localhost", port="19530")
 
     collection_name = f"{dataset}_collection"
-    # if utility.has_collection(collection_name):
-    #     utility.drop_collection(collection_name)
+
+    if utility.has_collection(collection_name):
+        raise MilvusException(
+            f"Collection '{collection_name}' already exists! Use a different name or manually delete the existing collection."
+        )
+        utility.drop_collection(collection_name)
 
     collection = create_milvus_collection(collection_name)
     print(f"Created Milvus collection: {collection_name}")
