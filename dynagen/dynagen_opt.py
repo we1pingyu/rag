@@ -995,6 +995,7 @@ class OptLM:
             )
 
     def sync(self):
+        print("Synchronizing...")
         self.env.disk.synchronize()
         torch.cuda.synchronize()
 

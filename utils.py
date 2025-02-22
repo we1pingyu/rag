@@ -493,7 +493,7 @@ def batch_query(
         if partition_name not in partition_names[:resident_partitions]:
             load_start = time.time()
             collection.load(partition_names=[partition_name])
-            print(f"Loaded partition {partition_name} {get_milvus_memory_usage():.2f} GB")
+            # print(f"Loaded partition {partition_name} {get_milvus_memory_usage():.2f} GB")
             log_timing(timing_stats, "partition_load_time", time.time() - load_start)
 
         search_start = time.time()
@@ -560,7 +560,7 @@ def batch_generate_responses(
     for result in batch_results:
         context = result["answer"] if result["answer"] else "No relevant context found."
         prompt = f"""
-        Use ONLY information explicitly stated in the context. Do not add any external knowledge. Answer in max 20 words.
+        Use ONLY information explicitly stated in the context. Do not add any external knowledge. Answer in max 15 words.
 
         Question: {result['query']}
         Context: {context}
@@ -584,6 +584,7 @@ def batch_generate_responses(
 
         generate_start = time.time()
         if dynagen:
+            print("Generating ...")
             outputs = model.generate(
                 inputs,
                 do_sample=False,

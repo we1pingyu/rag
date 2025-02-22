@@ -32,18 +32,18 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
-    parser.add_argument("--total_questions", type=int, default=32, help="Total number of questions to process")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-70B-Instruct", help="LLM Model name")
+    parser.add_argument("--total_questions", type=int, default=6, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
     parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
     parser.add_argument("--cpu_memory_limit", type=int, default=256, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=24, help="GPU memory limit in GB")
-    parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
+    parser.add_argument("--resident_partitions", type=int, default=3, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
-    parser.add_argument("--num_partitions", type=int, default=16, help="Number of partitions for index building")
+    parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")
     parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
     parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -55,7 +55,7 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[5, 70, 0, 0],
+        default=[12, 64, 0, 100],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
@@ -107,7 +107,8 @@ if __name__ == "__main__":
 
             collection.load(["partition_0"])
             print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
-            available_cpu_mem = args.cpu_memory_limit - get_milvus_memory_usage() * (args.resident_partitions + 1)
+            partition_size_gb = get_milvus_memory_usage()
+            available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
             resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
             print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
 
@@ -201,6 +202,7 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 collection=collection,
                 partition_names=partition_names,
+                partition_size_gb=partition_size_gb,
                 model_config=model_config,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,

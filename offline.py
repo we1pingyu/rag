@@ -86,7 +86,7 @@ class OfflineProcessor:
             model=self.model,
             tokenizer=self.tokenizer,
             batch_results=batch_results,
-            max_new_tokens=32,
+            max_new_tokens=16,
             batch_size=len(batch),
             dynagen=self.dynagen,
         )

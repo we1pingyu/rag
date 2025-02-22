@@ -760,7 +760,9 @@ class TorchDisk:
         self.copy_queue.put_nowait(args)
 
     def synchronize(self):
+        print("Synchronize disk copy threads")
         self.copy_queue.join()
+        print("Disk copy threads synchronized")
 
     def close_copy_threads(self):
         for _ in range(len(self.copy_threads)):
