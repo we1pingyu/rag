@@ -635,7 +635,6 @@ class TorchDevice:
         # shape: (s, b * n_head, head_dim)
         k_cpu = k_cpu[:src_s, seg:, :]
         v_cpu = v_cpu[:src_s, seg:, :]
-        # print(k_cpu.shape, k_new.shape)
         k_cpu[src_s - 1 : src_s, :, :] = k_new[:, seg:, :]
         v_cpu[src_s - 1 : src_s, :, :] = v_new[:, seg:, :]
         # shape: (b * n_head, head_dim, s)
@@ -760,7 +759,7 @@ class TorchDisk:
         self.copy_queue.put_nowait(args)
 
     def synchronize(self):
-        print("Synchronize disk copy threads")
+        print("Synchronizing disk copy threads")
         self.copy_queue.join()
         print("Disk copy threads synchronized")
 
@@ -1059,6 +1058,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=2):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    max_positions = cos.shape[0]
+    position_ids = torch.clamp(position_ids, max=max_positions - 1)
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)

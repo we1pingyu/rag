@@ -32,15 +32,15 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
-    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-70B-Instruct", help="LLM Model name")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=6, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
     parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=256, help="CPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=196, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=24, help="GPU memory limit in GB")
-    parser.add_argument("--resident_partitions", type=int, default=3, help="Number of resident partitions")
+    parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
     parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")

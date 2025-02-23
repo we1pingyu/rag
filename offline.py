@@ -5,7 +5,6 @@ from utils import batch_query, batch_generate_responses, batch_query_qdrant, Que
 
 
 class OfflineProcessor:
-    """专门用于离线批处理的处理器，不考虑到达率"""
 
     def __init__(
         self,

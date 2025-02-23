@@ -128,7 +128,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
-    def generation_loop_overlap_single_batch(self, this, evaluate, profile_dir):
+    def generation_loop_overlap_single_batch(self, this, evaluate):
         # Prologue
         this.load_weight(0, 0, 0)
         this.sync()
@@ -154,7 +154,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
             if this.task.stop and np.all(this.stopped):
                 break
 
-    def generation_loop_overlap_multi_batch(self, this, profile_dir):
+    def generation_loop_overlap_multi_batch(self, this):
         # Prologue
         for k in range(this.num_gpu_batches):
             this.load_weight(0, 0, k)

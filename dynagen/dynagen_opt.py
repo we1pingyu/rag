@@ -995,7 +995,6 @@ class OptLM:
             )
 
     def sync(self):
-        print("Synchronizing...")
         self.env.disk.synchronize()
         torch.cuda.synchronize()
 
@@ -1044,10 +1043,22 @@ class OptLM:
             val.load_from_np((input_ids != self.config.pad_token_id))
             self.attention_mask_gpu[k].store(val)
 
-    def update_policy(self, cache_gpu_percent, cache_cpu_percent, gpu_batch_size):
+    def update_policy(self, cache_gpu_percent, cache_cpu_percent, gpu_batch_size, num_gpu_batches):
         self.policy.cache_gpu_percent = cache_gpu_percent
         self.policy.cache_cpu_percent = cache_cpu_percent
-        self.policy.gpu_batch_size = gpu_batch_size
+        self.gpu_batch_size = self.policy.gpu_batch_size = gpu_batch_size
+        self.num_gpu_batches = self.policy.num_gpu_batches = num_gpu_batches
+        # cache[j][k]
+        self.cache_home = array_2d(self.num_layers, num_gpu_batches, ValueHolder)
+        self.cache_read_buf = array_2d(self.num_layers, num_gpu_batches, ValueHolder)
+        self.cache_write_buf = array_2d(self.num_layers, num_gpu_batches, ValueHolder)
+        # weight[j]
+        self.weight_read_buf = array_1d(self.num_layers, ValueHolder)
+        # attention_mask[k]
+        self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
+        self.attention_mask_gpu = None
+        if self.policy.cpu_cache_compute:
+            self.attention_mask_gpu = array_1d(num_gpu_batches, ValueHolder)
 
     def generate(
         self,
@@ -1077,7 +1088,7 @@ class OptLM:
             evaluate=evaluate,
         )
         num_layers = self.num_layers
-        num_gpu_batches = self.num_gpu_batches
+        num_gpu_batches = self.policy.num_gpu_batches
         gpu_batch_size = self.policy.gpu_batch_size
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
@@ -1093,14 +1104,15 @@ class OptLM:
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+        ori_num_gpu_batches = len(self.attention_mask)
         for j in range(num_layers):
-            for k in range(num_gpu_batches):
+            for k in range(ori_num_gpu_batches):
                 self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
-        for k in range(num_gpu_batches):
+        for k in range(ori_num_gpu_batches):
             self.attention_mask[k].clear()
             if self.attention_mask_gpu:
                 self.attention_mask_gpu[k].clear()
@@ -1122,9 +1134,9 @@ class OptLM:
             else:
                 # Overlap I/O and compute
                 if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch(evaluate, profile_dir=profile_dir)
+                    self.generation_loop_overlap_single_batch(evaluate)
                 else:
-                    self.generation_loop_overlap_multi_batch(profile_dir=profile_dir)
+                    self.generation_loop_overlap_multi_batch()
         elif debug_mode == "fewer_batch":
             # Run fewer layeres and batches for debugging
             if num_gpu_batches == 1:
@@ -1157,11 +1169,11 @@ class OptLM:
     def generation_loop_debug_normal(self):
         self.computation_policy.generation_loop_debug_normal(self)
 
-    def generation_loop_overlap_single_batch(self, evaluate, profile_dir=None):
-        self.computation_policy.generation_loop_overlap_single_batch(self, evaluate, profile_dir)
+    def generation_loop_overlap_single_batch(self, evaluate):
+        self.computation_policy.generation_loop_overlap_single_batch(self, evaluate)
 
-    def generation_loop_overlap_multi_batch(self, profile_dir=None):
-        self.computation_policy.generation_loop_overlap_multi_batch(self, profile_dir)
+    def generation_loop_overlap_multi_batch(self):
+        self.computation_policy.generation_loop_overlap_multi_batch(self)
 
     def generation_loop_debug_single_batch(self):
         self.computation_policy.generation_loop_debug_single_batch(self)

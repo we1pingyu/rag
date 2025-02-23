@@ -47,7 +47,7 @@ class ComputationPolicyAlterStream(ComputationPolicyInterface):
   def generation_loop_normal(self, this, evaluate):
     raise NotImplementedError()
   
-  def generation_loop_overlap_single_batch(self, this, evaluate, profile_dir):
+  def generation_loop_overlap_single_batch(self, this, evaluate):
     def load_layer_weight(i, j, load_to_cpu=False):
       this.load_weight(i, j, 0, overlap=False)
     
@@ -95,7 +95,7 @@ class ComputationPolicyAlterStream(ComputationPolicyInterface):
       timers("generate").stop()
 
   
-  def generation_loop_overlap_multi_batch(self, this, profile_dir):
+  def generation_loop_overlap_multi_batch(self, this):
     def load_layer_weight(i, j):
       this.load_weight(i, j, 0, overlap=False)
       

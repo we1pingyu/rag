@@ -584,7 +584,6 @@ def batch_generate_responses(
 
         generate_start = time.time()
         if dynagen:
-            print("Generating ...")
             outputs = model.generate(
                 inputs,
                 do_sample=False,
