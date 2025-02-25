@@ -434,12 +434,7 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        if isinstance(attention_mask, tuple):
-            attention_mask_cpu, attention_mask_gpu = attention_mask
-            src_s = attention_mask_cpu.shape[1]
-        else:
-            attention_mask_cpu = attention_mask_gpu = attention_mask
-            src_s = attention_mask.shape[1]
+        src_s = attention_mask.shape[1]
         head_dim = h // n_head
         scaling = head_dim**-0.5
 
@@ -480,12 +475,12 @@ class TorchDevice:
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
                 if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask_gpu.data, b, src_s, tgt_s, n_head, head_dim)
+                    value = self._attention_value(q, k, v, attention_mask.data, b, src_s, tgt_s, n_head, head_dim)
                 else:
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = (
-                        self._attention_value(q, k, v, attention_mask_cpu.data, b, src_s, tgt_s, n_head, head_dim)
+                        self._attention_value(q, k, v, attention_mask.data, b, src_s, tgt_s, n_head, head_dim)
                         .cuda()
                         .half()
                     )
@@ -517,7 +512,7 @@ class TorchDevice:
                 v_cache,
                 k_new,
                 v_new,
-                (attention_mask_cpu.data, attention_mask_gpu.data) if attention_mask_cpu else attention_mask.data,
+                attention_mask.data,
                 b,
                 src_s,
                 tgt_s,
@@ -605,17 +600,9 @@ class TorchDevice:
         k_gpu, k_cpu = k_cache[0].data, k_cache[1].data
         v_gpu, v_cpu = v_cache[0].data, v_cache[1].data
         seg = k_gpu.shape[1]
-        b_gpu = seg // n_head
-
-        if isinstance(mask, tuple):
-            mask_cpu, mask_gpu = mask
-            mask_cpu = mask_cpu[b_gpu:]
-            mask_gpu = mask_gpu[:b_gpu]
-        else:
-            mask_gpu = mask[:b_gpu]
-            mask_cpu = mask[b_gpu:]
 
         # Compute GPU part
+        b_gpu = seg // n_head
         q_gpu = q[:seg]
         # shape: (s, b * n_head, head_dim)
         k_gpu = k_gpu[:src_s, :seg, :]
@@ -627,6 +614,7 @@ class TorchDevice:
         # shape: (b * n_head, s, head_dim)
         v_gpu = v_gpu.permute(1, 0, 2)
 
+        mask_gpu = mask[:b_gpu].cuda()
         value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu, b_gpu, src_s, tgt_s, n_head, head_dim)
 
         # Compute CPU Part
@@ -642,7 +630,7 @@ class TorchDevice:
         # shape: (b * n_head, s, head_dim)
         v_cpu = v_cpu.permute(1, 0, 2)
 
-        # mask_cpu = mask[b_gpu:]
+        mask_cpu = mask[b_gpu:]
         value_cpu = self._attention_value(q_cpu, k_cpu, v_cpu, mask_cpu, b_cpu, src_s, tgt_s, n_head, head_dim)
 
         value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
@@ -706,6 +694,8 @@ class TorchDisk:
         self.name = path
         self.path = os.path.abspath(os.path.expanduser(path))
         self.mem_capacity = mem_capacity
+        self.cuda_id = cuda_id
+        self.num_copy_threads = num_copy_threads
 
         self.device_type = DeviceType.DISK
         self.compressed_device = TorchCompressedDevice(self)
@@ -759,9 +749,7 @@ class TorchDisk:
         self.copy_queue.put_nowait(args)
 
     def synchronize(self):
-        print("Synchronizing disk copy threads")
         self.copy_queue.join()
-        print("Disk copy threads synchronized")
 
     def close_copy_threads(self):
         for _ in range(len(self.copy_threads)):
@@ -770,6 +758,20 @@ class TorchDisk:
             t.join()
         self.copy_queue.join()
         self.copy_queue = None
+
+    def clear_copy_threads(self):
+        for _ in range(len(self.copy_threads)):
+            self.copy_queue.put_nowait(None)
+        for t in self.copy_threads:
+            t.join()
+        self.copy_queue.join()
+        self.copy_queue = queue.Queue()
+        self.copy_threads = [
+            threading.Thread(target=copy_worker_func, args=(self.copy_queue, self.cuda_id))
+            for _ in range(self.num_copy_threads)
+        ]
+        for t in self.copy_threads:
+            t.start()
 
     def mem_stats(self):
         raise NotImplementedError()
@@ -1246,13 +1248,7 @@ class LlamaTorchDevice(TorchDevice):
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        if isinstance(attention_mask, tuple):
-            attention_mask_cpu, attention_mask_gpu = attention_mask
-            src_s = attention_mask_cpu.shape[1]
-        else:
-            attention_mask_cpu = attention_mask_gpu = attention_mask
-            src_s = attention_mask.shape[1]
-        # src_s = attention_mask.shape[1]
+        src_s = attention_mask.shape[1]
         head_dim = h // n_head
         scaling = head_dim**-0.5
 
@@ -1300,12 +1296,12 @@ class LlamaTorchDevice(TorchDevice):
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
                 if k.is_cuda:
-                    value = self._attention_value(q, k, v, attention_mask_gpu.data, b, src_s, tgt_s, n_head, head_dim)
+                    value = self._attention_value(q, k, v, attention_mask.data, b, src_s, tgt_s, n_head, head_dim)
                 else:
                     q = q.float().cpu()
                     k, v = k.float(), v.float()
                     value = (
-                        self._attention_value(q, k, v, attention_mask_cpu.data, b, src_s, tgt_s, n_head, head_dim)
+                        self._attention_value(q, k, v, attention_mask.data, b, src_s, tgt_s, n_head, head_dim)
                         .cuda()
                         .half()
                     )
@@ -1337,7 +1333,7 @@ class LlamaTorchDevice(TorchDevice):
                 v_cache,
                 k_new,
                 v_new,
-                (attention_mask_cpu.data, attention_mask_gpu.data) if attention_mask_cpu else attention_mask.data,
+                attention_mask.data,
                 b,
                 src_s,
                 tgt_s,

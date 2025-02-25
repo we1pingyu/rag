@@ -201,11 +201,7 @@ class InputEmbed:
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
-        if isinstance(attention_mask, tuple):
-            mask = attention_mask[1].val
-            donate[1] = False
-        else:
-            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
@@ -555,21 +551,9 @@ class SelfAttention:
         self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
     ):
         n_head = self.config.n_head
-        if not cpu_delegation is None:
-            attention_compute = self.env.cpu if cpu_delegation else self.env.gpu
-        else:
-            attention_compute = self.attention_compute
         donate = [False] * 14
         h, donate[0] = hidden.val, True
-        if isinstance(attention_mask, tuple):
-            mask_cpu = attention_mask[0].val
-            mask_gpu = attention_mask[1].val
-            donate[1] = False
-        else:
-            if i == 0:
-                mask_gpu, donate[1] = attention_mask.val.smart_copy(self.compute)
-            else:
-                mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
+
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
@@ -599,9 +583,10 @@ class SelfAttention:
             ) = weight_read_buf.val
 
         if i == 0:  # prefill
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha(
                 h,
-                mask_gpu,
+                mask,
                 w_q,
                 b_q,
                 w_k,
@@ -619,10 +604,11 @@ class SelfAttention:
             )
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
+            mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen(
                 h,
-                (mask_cpu, mask_gpu) if isinstance(attention_mask, tuple) else mask_gpu,
+                mask,
                 w_q,
                 b_q,
                 w_k,
@@ -787,9 +773,6 @@ class OptLM:
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-        self.attention_mask_gpu = None
-        if self.policy.cpu_cache_compute:
-            self.attention_mask_gpu = array_1d(num_gpu_batches, ValueHolder)
         self.task = None
         self.init_all_weights()
 
@@ -969,11 +952,7 @@ class OptLM:
                 self.hidden[i][j][k],
                 self.cache_read_buf[j][k],
                 self.weight_read_buf[j],
-                (
-                    (self.attention_mask[k], self.attention_mask_gpu[k])
-                    if self.attention_mask_gpu
-                    else self.attention_mask[k]
-                ),
+                 self.attention_mask[k],
                 self.cache_write_buf[j][k],
                 i,
                 k,
@@ -984,11 +963,7 @@ class OptLM:
                 self.hidden[i][j][k],
                 self.cache_read_buf[j][k],
                 self.weight_read_buf[j],
-                (
-                    (self.attention_mask[k], self.attention_mask_gpu[k])
-                    if self.attention_mask_gpu
-                    else self.attention_mask[k]
-                ),
+                self.attention_mask[k],
                 self.cache_write_buf[j][k],
                 i,
                 k,
@@ -1014,11 +989,6 @@ class OptLM:
             mask = self.attention_mask[k]
             assert mask.val is not None
             mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
-
-            if self.attention_mask_gpu:
-                mask = self.attention_mask_gpu[k]
-                assert mask.val is not None
-                mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
             return
 
         gpu_batch_size = self.policy.gpu_batch_size
@@ -1030,18 +1000,6 @@ class OptLM:
         val = attention_compute.allocate((self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
-
-        if self.attention_mask_gpu:
-
-            gpu_batch_size = self.policy.gpu_batch_size
-            left = k * gpu_batch_size
-            right = left + gpu_batch_size
-            input_ids = self.output_ids[left:right, : self.task.prompt_len]
-
-            attention_compute = self.env.gpu
-            val = attention_compute.allocate((self.policy.gpu_batch_size, self.task.prompt_len), bool)
-            val.load_from_np((input_ids != self.config.pad_token_id))
-            self.attention_mask_gpu[k].store(val)
 
     def update_policy(self, cache_gpu_percent, cache_cpu_percent, gpu_batch_size, num_gpu_batches):
         self.policy.cache_gpu_percent = cache_gpu_percent
@@ -1056,9 +1014,6 @@ class OptLM:
         self.weight_read_buf = array_1d(self.num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-        self.attention_mask_gpu = None
-        if self.policy.cpu_cache_compute:
-            self.attention_mask_gpu = array_1d(num_gpu_batches, ValueHolder)
 
     def generate(
         self,
@@ -1114,8 +1069,6 @@ class OptLM:
             self.weight_read_buf[j].clear()
         for k in range(ori_num_gpu_batches):
             self.attention_mask[k].clear()
-            if self.attention_mask_gpu:
-                self.attention_mask_gpu[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
         # Init cache

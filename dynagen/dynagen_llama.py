@@ -122,11 +122,7 @@ class LlamaInputEmbed(InputEmbed):
         # Compute input embedding
         donate = [False] * 3
         h, donate[0] = hidden.val, True
-        if isinstance(attention_mask, tuple):
-            mask = attention_mask[1].val
-            donate[1] = False
-        else:
-            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute)
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             ((w_token, donate[2]),) = weight_read_buf.pop()
@@ -300,22 +296,9 @@ class LlamaSelfAttention(SelfAttention):
     ):
         n_head = self.config.n_head
         n_kv_head = self.config.num_key_value_heads
-        compute = self.compute
-        if not cpu_delegation is None:
-            attention_compute = self.env.cpu if cpu_delegation else self.env.gpu
-        else:
-            attention_compute = self.attention_compute
+
         donate = [False] * 10
         h, donate[0] = hidden.val, True
-        if isinstance(attention_mask, tuple):
-            mask_cpu = attention_mask[0].val
-            mask_gpu = attention_mask[1].val
-            donate[1] = False
-        else:
-            if i == 0:
-                mask_gpu, donate[1] = attention_mask.val.smart_copy(compute)
-            else:
-                mask_gpu, donate[1] = attention_mask.val.smart_copy(attention_compute)
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
             (
@@ -330,11 +313,12 @@ class LlamaSelfAttention(SelfAttention):
             ((w_ln, _), (w_q, _), (w_k, _), (w_v, _), (w_re, _), (w_o, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
-            position_ids = torch.cumsum(mask_gpu.data, dim=1).int() * mask_gpu.data
-            h, new_k_cache, new_v_cache = compute.llama_mha(
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            position_ids = torch.cumsum(mask.data, dim=1).int() * mask.data
+            h, new_k_cache, new_v_cache = self.compute.llama_mha(
                 h,
                 position_ids,
-                mask_gpu,
+                mask,
                 w_ln,
                 w_q,
                 w_k,
@@ -350,14 +334,14 @@ class LlamaSelfAttention(SelfAttention):
             )
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
-            # mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[8]), (v_cache, donate[9]) = cache_read_buf.pop()
-            position_ids = torch.cumsum(mask_gpu.data, dim=1).long() * mask_gpu.data
+            position_ids = torch.cumsum(mask.data, dim=1).long() * mask.data
             position_ids = position_ids[:, -h.shape[1]].unsqueeze(1)
-            h, new_k_cache, new_v_cache = compute.llama_mha_gen(
+            h, new_k_cache, new_v_cache = self.compute.llama_mha_gen(
                 h,
                 position_ids,
-                (mask_cpu, mask_gpu) if isinstance(attention_mask, tuple) else mask_gpu,
+                mask,
                 w_ln,
                 w_q,
                 w_k,
@@ -509,9 +493,6 @@ class LlamaLM(OptLM):
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-        self.attention_mask_gpu = None
-        if self.policy.cpu_cache_compute:
-            self.attention_mask_gpu = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
         self.init_all_weights()

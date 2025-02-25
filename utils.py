@@ -9,12 +9,12 @@ import gc
 import random
 import functools
 import numpy as np
+import shutil
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
-
 from dataclasses import dataclass
 from langchain.docstore.document import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
@@ -73,10 +73,27 @@ def print_memory_usage(prefix: str = "") -> None:
     print(f"{prefix}Memory Usage - RSS: {memory_info['rss']:.2f} GB, VMS: {memory_info['vms']:.2f} GB")
 
 
+def split_batch(batch_size, max_split_size=8):
+    if batch_size <= max_split_size:
+        return batch_size, 1
+
+    for i in range(1, 7):
+        split_factor = 2**i
+        if batch_size <= split_factor * max_split_size:
+            batch_size_split = batch_size / split_factor
+            if not batch_size_split.is_integer():
+                raise ValueError(f"Batch size {batch_size} is not divisible by {split_factor}")
+            return int(batch_size_split), split_factor
+
+    return None
+
+
 def init_dynagen_model(model_name, tokenizer, args):
     """Initialize dynagen Llama model with specified configuration"""
     gpu = LlamaTorchDevice("cuda:0")
     cpu = LlamaTorchDevice("cpu")
+    if os.path.exists("./dynagen_offload_dir"):
+        shutil.rmtree("./dynagen_offload_dir")
     disk = TorchDisk("./dynagen_offload_dir")
     env = ExecutionEnv(
         gpu=gpu, cpu=cpu, disk=disk, mixed=get_torch_mixed_device_mem_manager("default", [gpu, cpu, disk])
@@ -612,6 +629,10 @@ def batch_generate_responses(
     for result, response in zip(batch_results, all_responses):
         result["llm_response"] = response
     log_timing(timing_stats, "results_compilation_time", time.time() - compile_start)
+    torch.cuda.empty_cache()
+    gc.collect()
+    if dynagen:
+        env.disk.clear_copy_threads()
     return batch_results, timing_stats
 
 

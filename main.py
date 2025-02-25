@@ -55,7 +55,7 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[12, 64, 0, 100],
+        default=[20, 50, 10, 20],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
@@ -137,14 +137,14 @@ if __name__ == "__main__":
                 padding_side="left",
             ).input_ids
             # Perform warmup
-            if not args.active:
-                model.generate(
-                    dummy_input,
-                    do_sample=False,
-                    max_new_tokens=1,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            torch.cuda.empty_cache()
+            # if not args.active:
+            #     model.generate(
+            #         dummy_input,
+            #         do_sample=False,
+            #         max_new_tokens=1,
+            #         pad_token_id=tokenizer.pad_token_id,
+            #     )
+            # torch.cuda.empty_cache()
         else:
             print("\nInitializing HF model...")
             max_memory_per_batch = 1.5  # GiB per batch
@@ -188,11 +188,15 @@ if __name__ == "__main__":
                 embedding_model=embedding_model,
                 model=model,
                 tokenizer=tokenizer,
-                collection=client if args.qdrant else collection,
-                partition_names=partition_names,
+                collection=collection,
+                partition_names=["partition_0"],
+                w_gpu_percent=args.percent[0],
+                w_cpu_percent=args.percent[1],
+                cache_gpu_percent=args.percent[2],
+                cache_cpu_percent=args.percent[3],
                 resident_partitions=args.resident_partitions,
-                use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
+                env=env,
             )
         elif args.active:
             processor = ActiveProfilingProcessor(

@@ -1,7 +1,7 @@
 import time
 from typing import List, Dict
 from tqdm import tqdm
-from utils import batch_query, batch_generate_responses, batch_query_qdrant, Question
+from utils import batch_query, batch_generate_responses, split_batch, Question
 
 
 class OfflineProcessor:
@@ -16,8 +16,12 @@ class OfflineProcessor:
         collection,
         partition_names: List[str],
         resident_partitions: int = 0,
-        use_qdrant: bool = False,
+        w_gpu_percent=0,
+        w_cpu_percent=0,
+        cache_gpu_percent=0,
+        cache_cpu_percent=0,
         dynagen: bool = False,
+        env=None,
     ):
         self.questions = questions
         self.batch_size = batch_size
@@ -27,8 +31,12 @@ class OfflineProcessor:
         self.collection = collection
         self.partition_names = partition_names
         self.resident_partitions = resident_partitions
-        self.use_qdrant = use_qdrant
+        self.w_gpu_percent = w_gpu_percent
+        self.w_cpu_percent = w_cpu_percent
+        self.cache_gpu_percent = cache_gpu_percent
+        self.cache_cpu_percent = cache_cpu_percent
         self.dynagen = dynagen
+        self.env = env
         self.results = []
         self.base_time = time.time()
 
@@ -55,26 +63,22 @@ class OfflineProcessor:
         self.timing_breakdown["embedding_times"].append(embed_time)
         self.timing_breakdown["embedding_total"] += embed_time
 
+        batch_size_split, num_batches = split_batch(self.batch_size)
+        print(f"batch_size_split: {batch_size_split}, num_batches: {num_batches}")
+        print(f"cache_gpu_percent: {self.cache_gpu_percent}, cache_cpu_percent: {self.cache_cpu_percent}")
+        self.model.update_policy(self.cache_gpu_percent, self.cache_gpu_percent, self.batch_size, 1)
+        self.model.update_weight(self.w_gpu_percent, self.w_cpu_percent)
         # 2. Query 阶段
         query_start = time.time()
-        if self.use_qdrant:
-            batch_results, _ = batch_query_qdrant(
-                client=self.collection,
-                questions=batch,
-                query_texts=query_texts,
-                query_embeddings=query_embeddings,
-                partition_names=self.partition_names,
-                resident_partitions=self.resident_partitions,
-            )
-        else:
-            batch_results, _ = batch_query(
-                collection=self.collection,
-                questions=batch,
-                query_texts=query_texts,
-                query_embeddings=query_embeddings,
-                partition_names=self.partition_names,
-                resident_partitions=self.resident_partitions,
-            )
+
+        batch_results, _ = batch_query(
+            collection=self.collection,
+            questions=batch,
+            query_texts=query_texts,
+            query_embeddings=query_embeddings,
+            partition_names=self.partition_names,
+            resident_partitions=self.resident_partitions,
+        )
         query_time = time.time() - query_start
         self.timing_breakdown["query_times"].append(query_time)
         self.timing_breakdown["query_total"] += query_time
@@ -88,6 +92,7 @@ class OfflineProcessor:
             max_new_tokens=16,
             batch_size=len(batch),
             dynagen=self.dynagen,
+            env=self.env,
         )
         gen_time = time.time() - gen_start
         self.timing_breakdown["generation_times"].append(gen_time)
@@ -122,7 +127,7 @@ class OfflineProcessor:
         total_start = time.time()
 
         # 释放所有分区（如果使用Milvus）
-        if not self.resident_partitions and not self.use_qdrant:
+        if not self.resident_partitions:
             self.collection.release()
 
         # 按batch处理所有问题
