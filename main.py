@@ -6,6 +6,7 @@ import random
 import torch
 import os
 import warnings
+import shutil
 from pathlib import Path
 from pymilvus import connections, Collection
 from pipeline import PipelineProcessor
@@ -38,8 +39,8 @@ if __name__ == "__main__":
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
     parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=196, help="CPU memory limit in GB")
-    parser.add_argument("--gpu_memory_limit", type=int, default=24, help="GPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=180, help="CPU memory limit in GB")
+    parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
@@ -55,10 +56,9 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[20, 50, 10, 20],
+        default=[5, 95, 0, 100],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -127,7 +127,7 @@ if __name__ == "__main__":
         if args.dynagen:
             print("\nInitializing DynaGen model...")
             model, model_config, env = init_dynagen_model(model_name, tokenizer, args)
-            dummy_text = ["Hello world"] * args.batch_size  # Simple warmup text
+            dummy_text = ["Hello world"] * 4  # Simple warmup text
             dummy_input = tokenizer(
                 dummy_text,
                 return_tensors="pt",
@@ -137,14 +137,13 @@ if __name__ == "__main__":
                 padding_side="left",
             ).input_ids
             # Perform warmup
-            # if not args.active:
-            #     model.generate(
-            #         dummy_input,
-            #         do_sample=False,
-            #         max_new_tokens=1,
-            #         pad_token_id=tokenizer.pad_token_id,
-            #     )
-            # torch.cuda.empty_cache()
+            model.generate(
+                dummy_input,
+                do_sample=False,
+                max_new_tokens=1,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            torch.cuda.empty_cache()
         else:
             print("\nInitializing HF model...")
             max_memory_per_batch = 1.5  # GiB per batch
@@ -210,6 +209,7 @@ if __name__ == "__main__":
                 model_config=model_config,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
+                env=env,
             )
 
         elif args.dyn_offline:
@@ -342,4 +342,6 @@ if __name__ == "__main__":
             collection.release()
             connections.disconnect("default")
         if args.dynagen:
+            if os.path.exists("./dynagen_offload_dir"):
+                shutil.rmtree("./dynagen_offload_dir")
             env.close_copy_threads()

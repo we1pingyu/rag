@@ -193,7 +193,7 @@ class TorchDevice:
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         if self.device_type == DeviceType.CPU:
-            pin_memory = False if pin_memory is None else pin_memory
+            pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]
@@ -1188,7 +1188,7 @@ class LlamaTorchDevice(TorchDevice):
 
         # shape: (b, n_head, s, s)
         attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights.masked_fill_(~mask, -1e4)
         attn_weights = attn_weights.view(b * n_head, s, s)
         attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)

@@ -1,17 +1,20 @@
 import time
-from typing import List, Dict, Optional, Tuple
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import numpy as np
 import psutil
 import torch
-from tqdm import tqdm
-from utils import batch_query, batch_generate_responses
-from pymilvus import Partition
 import sys
 import xgboost as xgb
 import numpy as np
 import gc
+import os
+import shutil
+import random
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from typing import List, Dict, Optional, Tuple
+from tqdm import tqdm
+from utils import batch_query, batch_generate_responses, split_batch
+from pymilvus import Partition
 from sklearn.model_selection import train_test_split
 from itertools import product
 
@@ -29,7 +32,8 @@ class ActiveProfilingProcessor:
         partition_names: List[str],
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
-        safety_margin: float = 0.3,
+        safety_margin: float = 0.7,
+        env=None,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
@@ -38,17 +42,19 @@ class ActiveProfilingProcessor:
         self.collection = collection
         self.partition_names = partition_names
         self.model_config = model_config
-        self.total_cpu_gb = total_cpu_gb * safety_margin
+        self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
-        self.partition_size_gb = partition_size_gb * 1.1
-        self.compute_space_per_batch = self.estimate_cache_size(1)  # GB per batch
+        self.partition_size_gb = partition_size_gb * 1.2
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
+        self.env = env
 
         # Get model requirements
         self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
+        self.compute_weight_gb = self.total_weight_gb / self.model_config.num_hidden_layers
         print(f"Model weight size: {self.total_weight_gb:.2f} GB")
         print(f"Estimated cache size per batch: {self.estimate_cache_size(1):.2f} GB")
+        print(f"Estimated hidden size per batch: {self.estimate_hidden_size(1):.2f} GB")
 
     def get_memory_usage(self) -> Dict[str, float]:
         """Get current memory usage in GB"""
@@ -57,65 +63,19 @@ class ActiveProfilingProcessor:
         gpu_memory = torch.cuda.memory_allocated() / (1024**3)
         return {"cpu_used": memory_info.rss / (1024**3), "gpu_used": gpu_memory}
 
-    def generate_with_timeout(self, model, tokenizer, batch_results, max_new_tokens, batch_size, timeout):
-        """Generate responses with timeout and proper thread cleanup"""
+    def estimate_hidden_size(self, batch_size: int) -> float:
+        return self.model_config.hidden_bytes(batch_size, 512 + 16) / (1024**3)
 
-        def generate():
-            return batch_generate_responses(
-                model=model,
-                tokenizer=tokenizer,
-                batch_results=batch_results,
-                max_new_tokens=max_new_tokens,
-                batch_size=batch_size,
-            )
-
-        # Use a custom Event to signal thread termination
-        termination_event = threading.Event()
-        result = [None]
-        error_info = [None]
-
-        def wrapped_generate():
-            try:
-                result[0] = generate()
-            except Exception as e:
-                import traceback
-
-                error_traceback = traceback.format_exc()
-                error_message = f"Error in generation thread:\n{str(e)}\n\nTraceback:\n{error_traceback}"
-                print(error_message)
-                result[0] = None, f"error: {error_message}"
-                error_info[0] = error_message
-            finally:
-                termination_event.set()
-
-        # Start generation in a separate thread
-        thread = threading.Thread(target=wrapped_generate)
-        thread.daemon = True  # Mark as daemon so it won't prevent program exit
-        thread.start()
-
-        # Wait for either completion or timeout
-        timeout_occurred = not termination_event.wait(timeout=timeout)
-
-        if timeout_occurred:
-            print(f"Generation timed out after {timeout:.2f} seconds")
-            # Force thread cleanup by clearing model cache
-            if hasattr(model, "clear_cache"):
-                model.clear_cache()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            return None, "timeout"
-
-        if error_info[0]:
-            print(f"Generation completed with error: {error_info[0]}")
-        else:
-            print("Generation completed successfully")
-
-        return result[0]
-
-    def estimate_cache_size(self, batch_size: int) -> float:
+    def estimate_cache_size(self, batch_size: int, layers=1) -> float:
         """Estimate cache size in GB for given batch size"""
-        return self.model_config.cache_bytes(batch_size, 256 + 16) / (1024**3)
+        return self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
+
+    def gpu_memory_available(self, batch_size) -> bool:
+        return self.gpu_memory_gb - 1.1 * (
+            2 * self.estimate_cache_size(batch_size)
+            + 2 * self.compute_weight_gb
+            + self.estimate_hidden_size(batch_size)
+        )
 
     def update_resident_partitions(self, new_resident_partitions: int):
         """Update number of resident partitions"""
@@ -159,140 +119,128 @@ class ActiveProfilingProcessor:
 
         threading.excepthook = exception_handler
 
-        # try:
-        max_split_size = 32  # Maximum size for each batch split
-        assert batch_size % 4 == 0 or batch_size == 2, "Batch size must be divisible by 4 or equal to 2"
-        if batch_size <= max_split_size:
-            # If batch size is already less than or equal to 32, no need to split
-            batch_size_split = batch_size
-            num_batch = 1
-        elif batch_size > max_split_size and batch_size <= 2 * max_split_size:
-            # If batch size is between 32 and 64, split into 2 batches
-            batch_size_split = int(batch_size / 2)
-            num_batch = 2
-        elif batch_size > 2 * max_split_size and batch_size <= 4 * max_split_size:
-            # If batch size is greater than 64, split into 4 batches
-            batch_size_split = int(batch_size / 4)
-            num_batch = 4
-        else:
-            raise ValueError("Batch size must be less than 128")
+        try:
+            # if os.path.exists("./dynagen_offload_dir"):
+            #     shutil.rmtree("./dynagen_offload_dir")
+            #     os.makedirs("./dynagen_offload_dir")
+            batch_size_split, num_batch = split_batch(batch_size)
+            print(f"Available GPU memory: {self.gpu_memory_available(batch_size):.2f} GB")
+            print("Splitting batch into batches:", batch_size_split, ", num_batch: ", num_batch)
+            self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
+            self.model.update_weight(w_gpu_percent, w_cpu_percent)
+            actual_resident_partitions = self.update_resident_partitions(resident_partitions)
 
-        self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
-        self.model.update_weight(w_gpu_percent, w_cpu_percent)
-        actual_resident_partitions = self.update_resident_partitions(resident_partitions)
+            timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
 
-        timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
+            for i in range(num_test_batches):
+                if thread_exceptions:
+                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
+                    return {"error": "cpu_oom"}
 
-        for i in range(num_test_batches):
+                start_idx = i * batch_size
+                if start_idx >= len(self.questions):
+                    break
+
+                batch = self.questions[start_idx : start_idx + batch_size]
+                query_texts = [q["question"] for q in batch]
+                query_embeddings = self.embedding_model.embed_documents(query_texts)
+
+                query_start = time.time()
+                batch_results, _ = batch_query(
+                    collection=self.collection,
+                    questions=batch,
+                    query_texts=query_texts,
+                    query_embeddings=query_embeddings,
+                    partition_names=self.partition_names,
+                    resident_partitions=actual_resident_partitions,
+                )
+                query_time = time.time() - query_start
+
+                if thread_exceptions:
+                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
+                    return {"error": "cpu_oom"}
+
+                # Set timeout to 2x the previous generation time
+                timeout = self.prev_gen_time * 2  # Min 10s, max 300s
+                gen_start = time.time()
+                generation_result = batch_generate_responses(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    batch_results=batch_results,
+                    max_new_tokens=16,
+                    batch_size=batch_size,
+                    env=self.env,
+                )
+                gen_time = time.time() - gen_start
+
+                if generation_result[1] == "timeout":
+                    print(f"Generation timeout detected (>{timeout:.2f}s)")
+                    return {"error": "cpu_oom"}
+                elif "out of memory" in generation_result[1]:
+                    return {"error": "gpu_oom"}
+
+                responses, _ = generation_result
+
+                # Update previous generation time for next batch
+                self.prev_gen_time = gen_time
+
+                timing_stats["query_times"].append(query_time)
+                timing_stats["generation_times"].append(gen_time)
+                timing_stats["total_times"].append(query_time + gen_time)
+
             if thread_exceptions:
                 print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
                 return {"error": "cpu_oom"}
 
-            start_idx = i * batch_size
-            if start_idx >= len(self.questions):
-                break
+            avg_query_time = np.mean(timing_stats["query_times"])
+            avg_gen_time = np.mean(timing_stats["generation_times"])
+            avg_total_time = np.mean(timing_stats["total_times"])
 
-            batch = self.questions[start_idx : start_idx + batch_size]
-            query_texts = [q["question"] for q in batch]
-            query_embeddings = self.embedding_model.embed_documents(query_texts)
+            memory_usage = self.get_memory_usage()
 
-            query_start = time.time()
-            batch_results, _ = batch_query(
-                collection=self.collection,
-                questions=batch,
-                query_texts=query_texts,
-                query_embeddings=query_embeddings,
-                partition_names=self.partition_names,
-                resident_partitions=actual_resident_partitions,
-            )
-            query_time = time.time() - query_start
+            return {
+                "batch_size": batch_size,
+                "cache_gpu_percent": cache_gpu_percent,
+                "cache_cpu_percent": cache_cpu_percent,
+                "w_gpu_percent": w_gpu_percent,
+                "w_cpu_percent": w_cpu_percent,
+                "resident_partitions": actual_resident_partitions,
+                "avg_query_time": avg_query_time,
+                "avg_gen_time": avg_gen_time,
+                "avg_total_time": avg_total_time,
+                "memory_usage": memory_usage,
+                "success": True,
+            }
 
-            if thread_exceptions:
-                print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
-                return {"error": "cpu_oom"}
+        except (RuntimeError, torch.cuda.OutOfMemoryError, OSError, Exception) as e:
+            error_msg = str(e)
 
-            # Set timeout to 2x the previous generation time
-            timeout = self.prev_gen_time * 2  # Min 10s, max 300s
-            gen_start = time.time()
-            generation_result = batch_generate_responses(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                batch_results=batch_results,
-                max_new_tokens=16,
-                batch_size=batch_size,
-                # timeout=timeout,
-            )
-            gen_time = time.time() - gen_start
-
-            if generation_result[1] == "timeout":
-                print(f"Generation timeout detected (>{timeout:.2f}s)")
-                return {"error": "cpu_oom"}
-            elif "out of memory" in generation_result[1]:
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in error_msg:
+                print(f"GPU OOM detected: {error_msg}")
                 return {"error": "gpu_oom"}
+            elif (
+                "Cannot allocate memory" in error_msg
+                or "[Errno 12]" in error_msg
+                or "Resource temporarily unavailable" in error_msg
+                or "libgomp" in error_msg
+            ):
+                print(f"CPU OOM detected: {error_msg}")
+                return {"error": "cpu_oom"}
+            elif "Exception in thread" in error_msg and "Cannot allocate memory" in error_msg:
+                print(f"Thread-related CPU OOM detected: {error_msg}")
+                return {"error": "cpu_oom"}
+            else:
+                print(f"Other error detected: {error_msg}")
+                return {"error": "other", "message": error_msg}
 
-            responses, _ = generation_result
-
-            # Update previous generation time for next batch
-            self.prev_gen_time = gen_time
-
-            timing_stats["query_times"].append(query_time)
-            timing_stats["generation_times"].append(gen_time)
-            timing_stats["total_times"].append(query_time + gen_time)
-
-        if thread_exceptions:
-            print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
-            return {"error": "cpu_oom"}
-
-        avg_query_time = np.mean(timing_stats["query_times"])
-        avg_gen_time = np.mean(timing_stats["generation_times"])
-        avg_total_time = np.mean(timing_stats["total_times"])
-
-        memory_usage = self.get_memory_usage()
-
-        return {
-            "batch_size": batch_size,
-            "cache_gpu_percent": cache_gpu_percent,
-            "cache_cpu_percent": cache_cpu_percent,
-            "w_gpu_percent": w_gpu_percent,
-            "w_cpu_percent": w_cpu_percent,
-            "resident_partitions": actual_resident_partitions,
-            "avg_query_time": avg_query_time,
-            "avg_gen_time": avg_gen_time,
-            "avg_total_time": avg_total_time,
-            "memory_usage": memory_usage,
-            "success": True,
-        }
-
-        # except (RuntimeError, torch.cuda.OutOfMemoryError, OSError, Exception) as e:
-        #     error_msg = str(e)
-
-        #     if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in error_msg:
-        #         print(f"GPU OOM detected: {error_msg}")
-        #         return {"error": "gpu_oom"}
-        #     elif (
-        #         "Cannot allocate memory" in error_msg
-        #         or "[Errno 12]" in error_msg
-        #         or "Resource temporarily unavailable" in error_msg
-        #         or "libgomp" in error_msg
-        #     ):
-        #         print(f"CPU OOM detected: {error_msg}")
-        #         return {"error": "cpu_oom"}
-        #     elif "Exception in thread" in error_msg and "Cannot allocate memory" in error_msg:
-        #         print(f"Thread-related CPU OOM detected: {error_msg}")
-        #         return {"error": "cpu_oom"}
-        #     else:
-        #         print(f"Other error detected: {error_msg}")
-        #         return {"error": "other", "message": error_msg}
-
-        # finally:
-        #     threading.excepthook = sys.__excepthook__
+        finally:
+            threading.excepthook = sys.__excepthook__
 
     def calculate_memory_distribution(
         self, batch_size: int, available_gpu_memory: float, available_cpu_memory: float
     ) -> Dict[str, int]:
         """Calculate memory distribution across tiers"""
-        cache_size = self.estimate_cache_size(batch_size)
-
+        cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
         # Initialize distribution
         distribution = {
             "w_gpu_percent": 0,
@@ -370,14 +318,12 @@ class ActiveProfilingProcessor:
         valid_configs = []
 
         # GPU memory capacity in GB (after accounting for compute space)
-        gpu_memory_available = self.gpu_memory_gb - self.compute_space_per_batch * batch_size
-        if gpu_memory_available <= 0:
+        batch_size_split, _ = split_batch(batch_size)
+        if self.gpu_memory_available(batch_size) <= 0:
             print(f"Batch size {batch_size} exceeds GPU compute space")
             return None
 
         # Sample from the search space
-        import random
-
         candidates = []
         for _ in range(search_space_size):
             # Sample random configuration
@@ -397,14 +343,19 @@ class ActiveProfilingProcessor:
                 continue
 
             # 3. GPU memory constraint
-            gpu_usage = (w_gpu * self.total_weight_gb / 100) + (cache_gpu * self.estimate_cache_size(batch_size) / 100)
-            if gpu_usage > gpu_memory_available:
+            cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
+            gpu_usage = (
+                (w_gpu * self.total_weight_gb / 100)
+                + (cache_gpu * cache_size / 100)
+                + self.estimate_hidden_size(batch_size)
+            )
+            if gpu_usage > self.gpu_memory_available(batch_size):
                 continue
 
             # 4. CPU memory constraint
             cpu_usage = (
                 (w_cpu * self.total_weight_gb / 100)
-                + (cache_cpu * self.estimate_cache_size(batch_size) / 100)
+                + (cache_cpu * cache_size / 100)
                 + (resident_part * self.partition_size_gb)
             )
             if cpu_usage > self.total_cpu_gb:
@@ -443,7 +394,7 @@ class ActiveProfilingProcessor:
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [32, 64, 128]
+        batch_sizes = [256, 288]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -466,21 +417,23 @@ class ActiveProfilingProcessor:
             print(f"\nProfiling batch_size={batch_size}")
 
             # Calculate available memory after compute space
-            gpu_memory_available = self.gpu_memory_gb - self.compute_space_per_batch * batch_size
-            if gpu_memory_available <= 0:
+            batch_size_split, _ = split_batch(batch_size)
+            if self.gpu_memory_available(batch_size) <= 0:
                 print(f"Batch size {batch_size} exceeds GPU compute space")
                 break
 
             # Initial distribution - start with a reasonable default
-            distribution = self.calculate_memory_distribution(batch_size, gpu_memory_available, self.total_cpu_gb)
+            distribution = self.calculate_memory_distribution(
+                batch_size, self.gpu_memory_available(batch_size), self.total_cpu_gb
+            )
 
             best_config = None
             best_max_time = float("inf")
             retries = 0
-            max_retries = 5
+            max_retries = 10
 
             # Try getting an optimized config from the model if we have enough data
-            if len(training_data["batch_size"]) >= 5:
+            if len(training_data["batch_size"]) >= 10:
                 # Train the cost models
                 inf_model, query_model = self.learning_cost_model(
                     training_data["batch_size"],
@@ -596,9 +549,9 @@ class ActiveProfilingProcessor:
                     if max_time < best_max_time:
                         best_max_time = max_time
                         best_config = result
-
+                        cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
                         # Try using the model if we have enough data now
-                        if len(training_data["batch_size"]) >= 5:
+                        if len(training_data["batch_size"]) >= 10:
                             print("Enough data for training model, trying model prediction")
                             # Update the cost models with the latest data
                             inf_model, query_model = self.learning_cost_model(
@@ -656,7 +609,7 @@ class ActiveProfilingProcessor:
                                         distribution["w_cpu_percent"] + additional_weight,
                                     )
                                 elif distribution["cache_gpu_percent"] + distribution["cache_cpu_percent"] < 100:
-                                    additional_cache = int((freed_memory / self.estimate_cache_size(batch_size)) * 100)
+                                    additional_cache = int(freed_memory / cache_size * 100)
                                     distribution["cache_cpu_percent"] = min(
                                         100 - distribution["cache_cpu_percent"],
                                         distribution["cache_cpu_percent"] + additional_cache,
@@ -668,11 +621,9 @@ class ActiveProfilingProcessor:
                         else:
                             print("Query time is bottleneck, adjusting distribution")
                             # Try to improve query time
-                            if (
-                                distribution["cache_cpu_percent"] * self.estimate_cache_size(batch_size) / 100
-                                > self.partition_size_gb
-                            ):
-                                reduction = int(self.partition_size_gb / self.estimate_cache_size(batch_size) * 100)
+                            cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
+                            if distribution["cache_cpu_percent"] * cache_size / 100 > self.partition_size_gb:
+                                reduction = int(self.partition_size_gb / cache_size * 100)
                                 distribution["cache_cpu_percent"] -= reduction
                                 distribution["resident_partitions"] += 1
                             elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > self.partition_size_gb:
@@ -683,53 +634,51 @@ class ActiveProfilingProcessor:
                         break
                 else:
                     error_type = result.get("error")
+                    cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
                     available_gpu_memory = (
-                        self.gpu_memory_gb
-                        - self.compute_space_per_batch * batch_size
-                        - distribution["cache_gpu_percent"] * self.estimate_cache_size(batch_size) / 100
+                        self.gpu_memory_available(batch_size)
+                        - distribution["cache_gpu_percent"] * cache_size / 10
                         - distribution["w_gpu_percent"] * self.total_weight_gb / 100
                     )
-                    if error_type == "gpu_oom" and available_gpu_memory < 0.2 * self.gpu_memory_gb:
+                    if error_type == "gpu_oom" and available_gpu_memory < 0.3 * self.gpu_memory_gb:
                         print("GPU memory exhausted, retrying with reduced tensors")
                         # Calculate available CPU memory
                         used_cpu_memory = (
                             (self.total_weight_gb * distribution["w_cpu_percent"] / 100)
-                            + (self.estimate_cache_size(batch_size) * distribution["cache_cpu_percent"] / 100)
+                            + (cache_size * distribution["cache_cpu_percent"] / 100)
                             + (distribution["resident_partitions"] * self.partition_size_gb)
                         )
                         available_cpu_memory = self.total_cpu_gb - used_cpu_memory
 
                         # Then try to move cache from GPU first
-                        if distribution["cache_gpu_percent"] > 0:
-                            reduction = min(10, distribution["cache_gpu_percent"])
+                        remove_gpu_tensor_gb = 2
+                        remove_cpu_tensor_gb = 5
+                        if distribution["cache_gpu_percent"] * cache_size / 100 > remove_gpu_tensor_gb:
+                            reduction = int(remove_gpu_tensor_gb / cache_size * 100)
                             distribution["cache_gpu_percent"] -= reduction
 
                             # Calculate how much can fit in CPU
-                            cache_to_move_gb = self.estimate_cache_size(batch_size) * reduction / 100
-                            if available_cpu_memory >= cache_to_move_gb:
+                            if available_cpu_memory >= remove_gpu_tensor_gb:
                                 # Can fit in CPU
                                 distribution["cache_cpu_percent"] += reduction
-                                available_cpu_memory -= cache_to_move_gb
+                                available_cpu_memory -= remove_gpu_tensor_gb
                             else:
                                 # Can only fit part in CPU, rest goes to disk
-                                cpu_possible_percent = int(
-                                    (available_cpu_memory / self.estimate_cache_size(batch_size)) * 100
-                                )
+                                cpu_possible_percent = int((available_cpu_memory / cache_size) * 100)
                                 distribution["cache_cpu_percent"] += cpu_possible_percent
                                 # Rest implicitly goes to disk
                                 available_cpu_memory = 0
 
                         # Try to move weights if needed
-                        elif distribution["w_gpu_percent"] > 0:
-                            reduction = min(10, distribution["w_gpu_percent"])
+                        elif distribution["w_gpu_percent"] * self.total_weight_gb / 100 > remove_cpu_tensor_gb:
+                            reduction = int(remove_cpu_tensor_gb / self.total_weight_gb * 100)
                             distribution["w_gpu_percent"] -= reduction
 
                             # Calculate how much can fit in CPU
-                            weight_to_move_gb = self.total_weight_gb * reduction / 100
-                            if available_cpu_memory >= weight_to_move_gb:
+                            if available_cpu_memory >= remove_cpu_tensor_gb:
                                 # Can fit in CPU
                                 distribution["w_cpu_percent"] += reduction
-                                available_cpu_memory -= weight_to_move_gb
+                                available_cpu_memory -= remove_cpu_tensor_gb
                             else:
                                 # Can only fit part in CPU, rest goes to disk
                                 cpu_possible_percent = int((available_cpu_memory / self.total_weight_gb) * 100)
@@ -744,8 +693,8 @@ class ActiveProfilingProcessor:
                         if best_config and best_config["avg_query_time"] < best_config["avg_gen_time"]:
                             if distribution["resident_partitions"] > 0:
                                 distribution["resident_partitions"] -= 1
-                            elif distribution["cache_cpu_percent"] * self.estimate_cache_size(batch_size) / 100 > 10:
-                                reduction = int(10 / self.estimate_cache_size(batch_size) * 100)
+                            elif distribution["cache_cpu_percent"] * cache_size / 100 > 10:
+                                reduction = int(10 / cache_size * 100)
                                 distribution["cache_cpu_percent"] -= reduction
                             elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
                                 reduction = int(10 / self.total_weight_gb * 100)
@@ -753,8 +702,8 @@ class ActiveProfilingProcessor:
                             else:
                                 break
                         else:
-                            if distribution["cache_cpu_percent"] * self.estimate_cache_size(batch_size) / 100 > 10:
-                                reduction = int(10 / self.estimate_cache_size(batch_size) * 100)
+                            if distribution["cache_cpu_percent"] * cache_size / 100 > 10:
+                                reduction = int(10 / cache_size * 100)
                                 distribution["cache_cpu_percent"] -= reduction
                             elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
                                 reduction = int(10 / self.total_weight_gb * 100)

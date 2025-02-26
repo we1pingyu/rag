@@ -43,6 +43,7 @@ from .utils import (
     str2bool,
     project_decode_latency,
     write_benchmark_log,
+    log_memory_usage,
 )
 
 fix_recursive_import()
@@ -113,9 +114,6 @@ class LlamaInputEmbed(InputEmbed):
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst),))
 
-    def pop_weight(self, weight_read_buf):
-        weight_read_buf.pop()
-
     def forward(
         self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
     ):
@@ -175,9 +173,6 @@ class LlamaOutputEmbed(OutputEmbed):
             dst1 = self.weight_load_dst
             dst2 = self.compute
             weight_read_buf.store((w_ln.smart_copy(dst2), w_token.smart_copy(dst1)))
-
-    def pop_weight(self, weight_read_buf):
-        weight_read_buf.pop()
 
     def forward(
         self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
@@ -287,9 +282,6 @@ class LlamaSelfAttention(SelfAttention):
                     w_o.smart_copy(dst1),
                 )
             )
-
-    def pop_weight(self, weight_read_buf):
-        weight_read_buf.pop()
 
     def forward(
         self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None
@@ -414,9 +406,6 @@ class LlamaMLP(MLP):
             weight_read_buf.store(
                 (w_ln.smart_copy(dst2), w_g.smart_copy(dst1), w_u.smart_copy(dst1), w_d.smart_copy(dst1))
             )
-
-    def pop_weight(self, weight_read_buf):
-        weight_read_buf.pop()
 
     def forward(
         self, hidden, cache_read_buf, weight_read_buf, attention_mask, cache_write_buf, i, k, cpu_delegation=None

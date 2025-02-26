@@ -952,7 +952,7 @@ class OptLM:
                 self.hidden[i][j][k],
                 self.cache_read_buf[j][k],
                 self.weight_read_buf[j],
-                 self.attention_mask[k],
+                self.attention_mask[k],
                 self.cache_write_buf[j][k],
                 i,
                 k,

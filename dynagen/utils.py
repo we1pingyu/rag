@@ -48,7 +48,6 @@ class ExecutionEnv:
     def create(cls, offload_dir):
         # fix recursive import
         from .pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-        from .cache_tensor_manager import TorchCacheTensorDevice
 
         gpu = TorchDevice("cuda:0")
         cpu = TorchDevice("cpu")
@@ -58,11 +57,18 @@ class ExecutionEnv:
             cpu=cpu,
             disk=disk,
             mixed=TorchMixedDevice([gpu, cpu, disk]),
-            cache_mixed=TorchCacheTensorDevice([gpu, cpu, disk]),
         )
 
     def close_copy_threads(self):
         self.disk.close_copy_threads()
+
+
+def log_memory_usage(step_name):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / (1024**2)  # MB
+        reserved = torch.cuda.memory_reserved() / (1024**2)  # MB
+        print(f"[Memory Usage] {step_name}: Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
 
 
 @dataclasses.dataclass(frozen=True)

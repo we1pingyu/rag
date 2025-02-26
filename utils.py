@@ -73,7 +73,7 @@ def print_memory_usage(prefix: str = "") -> None:
     print(f"{prefix}Memory Usage - RSS: {memory_info['rss']:.2f} GB, VMS: {memory_info['vms']:.2f} GB")
 
 
-def split_batch(batch_size, max_split_size=8):
+def split_batch(batch_size, max_split_size=32):
     if batch_size <= max_split_size:
         return batch_size, 1
 
@@ -101,7 +101,7 @@ def init_dynagen_model(model_name, tokenizer, args):
 
     # Configure dynagen policy
     policy = Policy(
-        gpu_batch_size=args.batch_size,
+        gpu_batch_size=4,
         num_gpu_batches=1,
         w_gpu_percent=args.percent[0],  # Store all weights on GPU
         w_cpu_percent=args.percent[1],
@@ -111,7 +111,7 @@ def init_dynagen_model(model_name, tokenizer, args):
         act_cpu_percent=0,
         overlap=True,
         sep_layer=True,
-        pin_weight=False,
+        pin_weight=True,
         cpu_cache_compute=False,
         attn_sparsity=1.0,
         compress_weight=False,
@@ -505,7 +505,7 @@ def batch_query(
     aggregated_results = [[] for _ in range(len(query_texts))]
 
     # Process each partition
-    for partition_name in tqdm(partition_names, desc="Quering"):
+    for partition_name in tqdm(partition_names, desc="Querying"):
         # Only load if it's not a resident partition
         if partition_name not in partition_names[:resident_partitions]:
             load_start = time.time()
