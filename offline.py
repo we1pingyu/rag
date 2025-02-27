@@ -66,7 +66,7 @@ class OfflineProcessor:
         batch_size_split, num_batches = split_batch(self.batch_size)
         print(f"batch_size_split: {batch_size_split}, num_batches: {num_batches}")
         print(f"cache_gpu_percent: {self.cache_gpu_percent}, cache_cpu_percent: {self.cache_cpu_percent}")
-        self.model.update_policy(self.cache_gpu_percent, self.cache_gpu_percent, batch_size_split, num_batches)
+        self.model.update_policy(self.cache_gpu_percent, self.cache_cpu_percent, batch_size_split, num_batches)
         self.model.update_weight(self.w_gpu_percent, self.w_cpu_percent)
         # 2. Query 阶段
         query_start = time.time()

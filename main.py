@@ -56,9 +56,10 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[5, 95, 0, 100],
+        default=[0, 11, 66, 0],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 
     args = parser.parse_args()
     random.seed(args.seed)

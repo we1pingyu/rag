@@ -8,6 +8,7 @@ __pycache__
 test*.py
 logs/
 rag_data*/
+model_data*/
 *.zst
 *.gz
 *.txt

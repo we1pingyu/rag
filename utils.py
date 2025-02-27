@@ -111,7 +111,7 @@ def init_dynagen_model(model_name, tokenizer, args):
         act_cpu_percent=0,
         overlap=True,
         sep_layer=True,
-        pin_weight=True,
+        pin_weight=False,
         cpu_cache_compute=False,
         attn_sparsity=1.0,
         compress_weight=False,

@@ -762,9 +762,9 @@ class TorchDisk:
     def clear_copy_threads(self):
         for _ in range(len(self.copy_threads)):
             self.copy_queue.put_nowait(None)
-        for t in self.copy_threads:
-            t.join()
-        self.copy_queue.join()
+        # for t in self.copy_threads:
+        #     t.join()
+        # self.copy_queue.join()
         self.copy_queue = queue.Queue()
         self.copy_threads = [
             threading.Thread(target=copy_worker_func, args=(self.copy_queue, self.cuda_id))

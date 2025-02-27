@@ -10,6 +10,9 @@ import gc
 import os
 import shutil
 import random
+import json
+import math
+from scipy.optimize import linprog
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
@@ -299,102 +302,242 @@ class ActiveProfilingProcessor:
         batch_size: int,
         inf_model,
         query_model,
-        search_space_size: int = 500,
+        search_space_size: int = 500,  # Kept for backward compatibility but not used
     ):
-        """Find optimal configuration for a given batch size using the trained models"""
+        """Find optimal configuration for a given batch size using linear programming approach"""
         if inf_model is None or query_model is None:
             return None
 
-        import numpy as np
-
-        # Define search space
-        cache_gpu_range = np.linspace(0, 100, 10, dtype=int)
-        cache_cpu_range = np.linspace(0, 100, 10, dtype=int)
-        w_gpu_range = np.linspace(0, 100, 10, dtype=int)
-        w_cpu_range = np.linspace(0, 100, 10, dtype=int)
-        resident_partitions_range = np.arange(0, min(10, len(self.partition_names) + 1), 1, dtype=int)
-
-        # Generate all valid configurations
-        valid_configs = []
-
-        # GPU memory capacity in GB (after accounting for compute space)
+        # Check GPU memory capacity (after accounting for compute space)
         batch_size_split, _ = split_batch(batch_size)
         if self.gpu_memory_available(batch_size) <= 0:
             print(f"Batch size {batch_size} exceeds GPU compute space")
             return None
 
-        # Sample from the search space
-        candidates = []
-        for _ in range(search_space_size):
-            # Sample random configuration
-            cache_gpu = random.choice(cache_gpu_range)
-            cache_cpu = random.choice(cache_cpu_range)
-            w_gpu = random.choice(w_gpu_range)
-            w_cpu = random.choice(w_cpu_range)
-            resident_part = random.choice(resident_partitions_range)
+        # Get the linear regression coefficients
+        inf_coef = inf_model.coef_
+        inf_intercept = inf_model.intercept_
+        query_coef = query_model.coef_
+        query_intercept = query_model.intercept_
 
-            # Check constraints
-            # 1. Weight distribution constraint
-            if w_gpu + w_cpu > 100:
-                continue
+        # Define variables for linear programming
+        # x[0] = w_gpu_percent
+        # x[1] = w_cpu_percent
+        # x[2] = cache_gpu_percent
+        # x[3] = cache_cpu_percent
+        # x[4] = resident_partitions
+        # x[5] = maximum latency (we want to minimize this)
 
-            # 2. Cache distribution constraint
-            if cache_gpu + cache_cpu > 100:
-                continue
+        # Our objective is to minimize the maximum latency
+        c = [0, 0, 0, 0, 0, 1]
 
-            # 3. GPU memory constraint
-            cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
-            gpu_usage = (
-                (w_gpu * self.total_weight_gb / 100)
-                + (cache_gpu * cache_size / 100)
-                + self.estimate_hidden_size(batch_size)
+        # Define constraints for the optimization problem
+
+        # Cache size in GB for the given batch size
+        cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
+
+        # Hidden state size in GB for the given batch size
+        hidden_size = self.estimate_hidden_size(batch_size)
+
+        # 1. Inference latency <= max_latency
+        # inf_latency = inf_coef[0]*w_gpu + inf_coef[1]*w_cpu + inf_coef[2]*cache_gpu*batch_size +
+        #               inf_coef[3]*cache_cpu*batch_size + inf_coef[4]*batch_size +
+        #               inf_coef[5]*log(batch_size) + inf_intercept <= max_latency
+        #
+        # Rearranged: inf_coef[0]*w_gpu + inf_coef[1]*w_cpu + inf_coef[2]*cache_gpu*batch_size +
+        #             inf_coef[3]*cache_cpu*batch_size - max_latency <= -inf_coef[4]*batch_size -
+        #             inf_coef[5]*log(batch_size) - inf_intercept
+        A_inf_latency = [
+            inf_coef[0],
+            inf_coef[1],
+            inf_coef[2] * batch_size,
+            inf_coef[3] * batch_size,
+            0,  # resident_partitions not used in inference model
+            -1,  # -max_latency
+        ]
+        b_inf_latency = -inf_coef[4] * batch_size - inf_coef[5] * math.log(batch_size) - inf_intercept
+
+        # 2. Query latency <= max_latency
+        # query_latency = query_coef[0]*resident_partitions + query_coef[1]*batch_size + query_intercept <= max_latency
+        # Rearranged: query_coef[0]*resident_partitions - max_latency <= -query_coef[1]*batch_size - query_intercept
+        A_query_latency = [0, 0, 0, 0, query_coef[0], -1]  # Only resident_partitions and max_latency
+        b_query_latency = -query_coef[1] * batch_size - query_intercept
+
+        # 3. Weight distribution constraint: w_gpu + w_cpu <= 100
+        A_weight_dist = [1, 1, 0, 0, 0, 0]
+        b_weight_dist = 100
+
+        # 4. Cache distribution constraint: cache_gpu + cache_cpu <= 100
+        A_cache_dist = [0, 0, 1, 1, 0, 0]
+        b_cache_dist = 100
+
+        # 5. GPU memory constraint: (w_gpu*self.total_weight_gb/100) + (cache_gpu*cache_size/100) + hidden_size <= gpu_available
+        gpu_available = self.gpu_memory_available(batch_size)
+        A_gpu_mem = [self.total_weight_gb / 100, 0, cache_size / 100, 0, 0, 0]
+        b_gpu_mem = gpu_available - hidden_size
+
+        # 6. CPU memory constraint: (w_cpu*self.total_weight_gb/100) + (cache_cpu*cache_size/100) +
+        #                          (resident_partitions*self.partition_size_gb) <= self.total_cpu_gb
+        A_cpu_mem = [0, self.total_weight_gb / 100, 0, cache_size / 100, self.partition_size_gb, 0]
+        b_cpu_mem = self.total_cpu_gb
+
+        # 7. NEW CONSTRAINT: cache_gpu_percent + cache_cpu_percent >= 20
+        # Rearranged: -cache_gpu_percent - cache_cpu_percent <= -20
+        A_cache_min = [0, 0, -1, -1, 0, 0]
+        b_cache_min = -40
+
+        # 8. NEW CONSTRAINT: w_gpu_percent + w_cpu_percent >= 20
+        # Rearranged: -w_gpu_percent - w_cpu_percent <= -20
+        A_weight_min = [-1, -1, 0, 0, 0, 0]
+        b_weight_min = -40
+
+        # Combine all constraints
+        A_ub = [A_inf_latency, A_query_latency, A_weight_dist, A_cache_dist, A_gpu_mem, A_cpu_mem, A_cache_min, A_weight_min]
+        b_ub = [b_inf_latency, b_query_latency, b_weight_dist, b_cache_dist, b_gpu_mem, b_cpu_mem,]
+
+        # Variable bounds
+        # w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent >= 0
+        # resident_partitions >= 0 and <= len(self.partition_names)
+        # max_latency >= 0
+        bounds = [
+            (0, 100),  # w_gpu_percent
+            (0, 100),  # w_cpu_percent
+            (0, 100),  # cache_gpu_percent
+            (0, 100),  # cache_cpu_percent
+            (0, min(10, len(self.partition_names))),  # resident_partitions
+            (0, None),  # max_latency (no upper bound)
+        ]
+
+        # Solve the linear programming problem
+        try:
+            result = linprog(c=c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+
+            if result.success:
+                # Round solution values to integers
+                w_gpu_percent = round(result.x[0])
+                w_cpu_percent = round(result.x[1])
+                cache_gpu_percent = round(result.x[2])
+                cache_cpu_percent = round(result.x[3])
+                resident_partitions = round(result.x[4])
+                max_latency = result.x[5]
+
+                # Predict latencies using the optimized configuration
+                X_inf = np.array(
+                    [
+                        [
+                            w_gpu_percent,
+                            w_cpu_percent,
+                            cache_gpu_percent * batch_size,
+                            cache_cpu_percent * batch_size,
+                            batch_size,
+                            math.log(batch_size),
+                        ]
+                    ]
+                )
+
+                X_query = np.array([[resident_partitions, batch_size]])
+
+                predicted_inf_latency = inf_model.predict(X_inf)[0]
+                predicted_query_latency = query_model.predict(X_query)[0]
+
+                best_config = {
+                    "batch_size": int(batch_size),
+                    "cache_gpu_percent": int(cache_gpu_percent),
+                    "cache_cpu_percent": int(cache_cpu_percent),
+                    "w_gpu_percent": int(w_gpu_percent),
+                    "w_cpu_percent": int(w_cpu_percent),
+                    "resident_partitions": int(resident_partitions),
+                    "predicted_inf_latency": float(predicted_inf_latency),
+                    "predicted_query_latency": float(predicted_query_latency),
+                    "max_latency": float(max_latency),
+                }
+
+                os.makedirs("model_data", exist_ok=True)
+
+                # Save the optimal configuration for this batch size
+                config_file = f"model_data/optimal_config_batch{batch_size}.json"
+                all_configs_file = "model_data/all_optimal_configs.json"
+
+                with open(config_file, "w") as f:
+                    json.dump(best_config, f, indent=4)
+
+                # Update the record of all optimal configurations
+                all_configs = []
+                if os.path.exists(all_configs_file):
+                    with open(all_configs_file, "r") as f:
+                        try:
+                            all_configs = json.load(f)
+                        except:
+                            all_configs = []
+
+                # Check if a configuration for this batch size already exists
+                exists = False
+                for i, config in enumerate(all_configs):
+                    if config.get("batch_size") == batch_size:
+                        all_configs[i] = best_config
+                        exists = True
+                        break
+
+                if not exists:
+                    all_configs.append(best_config)
+
+                # Sort configurations by batch size
+                all_configs.sort(key=lambda x: x.get("batch_size", 0))
+
+                with open(all_configs_file, "w") as f:
+                    json.dump(all_configs, f, indent=4)
+
+                print(f"Saved optimal configuration for batch size {batch_size} to {config_file}")
+
+                return best_config
+            else:
+                print(f"Optimization failed: {result.message}")
+                return None
+        except Exception as e:
+            print(f"Error in optimization: {e}")
+
+            # Fallback to a simple feasible solution if optimization fails
+            print("Falling back to default configuration...")
+
+            # Calculate a basic memory distribution
+            distribution = self.calculate_memory_distribution(
+                batch_size, self.gpu_memory_available(batch_size), self.total_cpu_gb
             )
-            if gpu_usage > self.gpu_memory_available(batch_size):
-                continue
 
-            # 4. CPU memory constraint
-            cpu_usage = (
-                (w_cpu * self.total_weight_gb / 100)
-                + (cache_cpu * cache_size / 100)
-                + (resident_part * self.partition_size_gb)
+            # Create a fallback configuration
+            X_inf = np.array(
+                [
+                    [
+                        distribution["w_gpu_percent"],
+                        distribution["w_cpu_percent"],
+                        distribution["cache_gpu_percent"] * batch_size,
+                        distribution["cache_cpu_percent"] * batch_size,
+                        batch_size,
+                        math.log(batch_size),
+                    ]
+                ]
             )
-            if cpu_usage > self.total_cpu_gb:
-                continue
 
-            candidates.append([batch_size, cache_gpu, cache_cpu, w_gpu, w_cpu, resident_part])
+            X_query = np.array([[distribution["resident_partitions"], batch_size]])
 
-        if not candidates:
-            print(f"No valid configurations found for batch_size={batch_size}")
-            return None
+            predicted_inf_latency = inf_model.predict(X_inf)[0]
+            predicted_query_latency = query_model.predict(X_query)[0]
 
-        # Convert to numpy for batch prediction
-        candidates = np.array(candidates)
-
-        # Predict latencies for all valid configurations
-        inf_latencies = inf_model.predict(candidates)
-        query_latencies = query_model.predict(candidates)
-
-        # Compute max latency for each configuration
-        max_latencies = np.maximum(inf_latencies, query_latencies)
-
-        # Find the configuration with minimum max latency
-        best_idx = np.argmin(max_latencies)
-        best_config = {
-            "batch_size": int(candidates[best_idx][0]),
-            "cache_gpu_percent": int(candidates[best_idx][1]),
-            "cache_cpu_percent": int(candidates[best_idx][2]),
-            "w_gpu_percent": int(candidates[best_idx][3]),
-            "w_cpu_percent": int(candidates[best_idx][4]),
-            "resident_partitions": int(candidates[best_idx][5]),
-            "predicted_inf_latency": float(inf_latencies[best_idx]),
-            "predicted_query_latency": float(query_latencies[best_idx]),
-        }
-
-        return best_config
+            return {
+                "batch_size": int(batch_size),
+                "cache_gpu_percent": int(distribution["cache_gpu_percent"]),
+                "cache_cpu_percent": int(distribution["cache_cpu_percent"]),
+                "w_gpu_percent": int(distribution["w_gpu_percent"]),
+                "w_cpu_percent": int(distribution["w_cpu_percent"]),
+                "resident_partitions": int(distribution["resident_partitions"]),
+                "predicted_inf_latency": float(predicted_inf_latency),
+                "predicted_query_latency": float(predicted_query_latency),
+                "max_latency": max(predicted_inf_latency, predicted_query_latency),
+            }
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [256, 288]
+        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -471,9 +614,11 @@ class ActiveProfilingProcessor:
                     )
 
                     if result.get("success", False):
-                        # If the prediction was successful, use it as our best config
-                        best_config = result
-                        best_max_time = max(result["avg_gen_time"], result["avg_query_time"])
+                        # Store the model's prediction result for comparison
+                        max_time = max(result["avg_gen_time"], result["avg_query_time"])
+                        if max_time < best_max_time:
+                            best_max_time = max_time
+                            best_config = result
 
                         # Add to training data
                         training_data["batch_size"].append(batch_size)
@@ -485,15 +630,27 @@ class ActiveProfilingProcessor:
                         training_data["inference_latency"].append(result["avg_gen_time"])
                         training_data["query_latency"].append(result["avg_query_time"])
 
-                        # Successful prediction, add to optimal configs and continue to next batch size
-                        optimal_configs.append(best_config)
-                        prev_best_max_time = best_max_time
+                        # Initialize configurations_tried for tracking already tested configs
+                        configurations_tried = set()
+                        config_key = (
+                            batch_size,
+                            result["cache_gpu_percent"],
+                            result["cache_cpu_percent"],
+                            result["w_gpu_percent"],
+                            result["w_cpu_percent"],
+                            result["resident_partitions"],
+                        )
+                        configurations_tried.add(config_key)
 
-                        # Skip to next batch size
-                        continue
+                        # Note: We continue with the optimization process to verify if this is truly the best config
+                    else:
+                        # Initialize configurations_tried for tracking already tested configs
+                        configurations_tried = set()
 
             # If we don't have a model yet or the model prediction failed, use the iterative approach
-            configurations_tried = set()
+            else:
+                # Initialize configurations_tried for tracking already tested configs
+                configurations_tried = set()
 
             while retries < max_retries:
                 # Check if we've already tried this configuration
@@ -749,50 +906,140 @@ class ActiveProfilingProcessor:
         query_latency: List[float],
     ):
         """Build a cost model to predict inference and query latencies based on configuration parameters"""
+        import numpy as np
+        from sklearn.linear_model import LinearRegression
+        import json
+        import os
+        import math
 
-        # Create feature matrix
-        X = np.array(
-            [batch_size, cache_gpu_percent, cache_cpu_percent, w_gpu_percent, w_cpu_percent, resident_partitions]
-        ).T
+        # 创建特征矩阵
+        # 推理延迟模型的特征：根据注释中的公式
+        # a * w_gpu_percent + b * w_cpu_percent + c * cache_gpu_percent * batch_size +
+        # d * cache_cpu_percent * batch_size + e * batch_size + f * log(batch_size) + g
+        X_inf = np.column_stack(
+            [
+                w_gpu_percent,
+                w_cpu_percent,
+                [cache_gpu_percent[i] * batch_size[i] for i in range(len(batch_size))],
+                [cache_cpu_percent[i] * batch_size[i] for i in range(len(batch_size))],
+                batch_size,
+                [math.log(bs) if bs > 0 else 0 for bs in batch_size],
+            ]
+        )
 
-        # Train two models: one for inference latency and one for query latency
-        y_inference = np.array(inference_latency)
+        # 查询延迟模型的特征：根据注释中的公式
+        # a * resident_partitions + b * batch_size + c
+        X_query = np.column_stack([resident_partitions, batch_size])
+
+        # 创建目标向量
+        y_inf = np.array(inference_latency)
         y_query = np.array(query_latency)
 
-        # If we have very little data, use a simple model
-        if len(X) < 5:
-            print("Not enough data for training XGBoost model, using simple heuristics")
-            return None, None
+        # 训练推理延迟模型
+        inf_model = LinearRegression()
+        inf_model.fit(X_inf, y_inf)
 
-        # Split data for training and validation
-        X_train, X_val, y_inf_train, y_inf_val = train_test_split(X, y_inference, test_size=0.2, random_state=42)
-        _, _, y_q_train, y_q_val = train_test_split(X, y_query, test_size=0.2, random_state=42)
+        # 训练查询延迟模型
+        query_model = LinearRegression()
+        query_model.fit(X_query, y_query)
 
-        # Train inference latency model
-        inf_model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=50,
-            max_depth=3,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-        )
-        inf_model.fit(X_train, y_inf_train)
+        # 计算两个模型的MSE
+        inf_pred = inf_model.predict(X_inf)
+        inf_mse = np.mean((inf_pred - y_inf) ** 2)
 
-        # Train query latency model
-        query_model = xgb.XGBRegressor(
-            objective="reg:squarederror",
-            n_estimators=50,
-            max_depth=3,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-        )
-        query_model.fit(X_train, y_q_train)
+        query_pred = query_model.predict(X_query)
+        query_mse = np.mean((query_pred - y_query) ** 2)
 
-        # Evaluate models
-        print(f"Inference model validation score: {inf_model.score(X_val, y_inf_val):.4f}")
-        print(f"Query model validation score: {query_model.score(X_val, y_q_val):.4f}")
+        print(f"推理模型MSE: {inf_mse:.4f}")
+        print(f"查询模型MSE: {query_mse:.4f}")
+
+        # 保存模型参数和数据到人类可读的文件
+        os.makedirs("model_data", exist_ok=True)
+
+        # 保存推理模型参数
+        inf_model_params = {
+            "coefficients": inf_model.coef_.tolist(),
+            "intercept": float(inf_model.intercept_),
+            "features": [
+                "w_gpu_percent",
+                "w_cpu_percent",
+                "cache_gpu_percent * batch_size",
+                "cache_cpu_percent * batch_size",
+                "batch_size",
+                "log(batch_size)",
+            ],
+            "mse": float(inf_mse),
+            "equation": "inference_latency = "
+            + f"{inf_model.coef_[0]:.4f} * w_gpu_percent + "
+            + f"{inf_model.coef_[1]:.4f} * w_cpu_percent + "
+            + f"{inf_model.coef_[2]:.4f} * cache_gpu_percent * batch_size + "
+            + f"{inf_model.coef_[3]:.4f} * cache_cpu_percent * batch_size + "
+            + f"{inf_model.coef_[4]:.4f} * batch_size + "
+            + f"{inf_model.coef_[5]:.4f} * log(batch_size) + "
+            + f"{inf_model.intercept_:.4f}",
+        }
+
+        with open("model_data/inference_model_params.json", "w") as f:
+            json.dump(inf_model_params, f, indent=4)
+
+        # 保存查询模型参数
+        query_model_params = {
+            "coefficients": query_model.coef_.tolist(),
+            "intercept": float(query_model.intercept_),
+            "features": ["resident_partitions", "batch_size"],
+            "mse": float(query_mse),
+            "equation": "query_latency = "
+            + f"{query_model.coef_[0]:.4f} * resident_partitions + "
+            + f"{query_model.coef_[1]:.4f} * batch_size + "
+            + f"{query_model.intercept_:.4f}",
+        }
+
+        with open("model_data/query_model_params.json", "w") as f:
+            json.dump(query_model_params, f, indent=4)
+
+        # 保存训练数据
+        training_data = {
+            "batch_size": batch_size,
+            "cache_gpu_percent": cache_gpu_percent,
+            "cache_cpu_percent": cache_cpu_percent,
+            "w_gpu_percent": w_gpu_percent,
+            "w_cpu_percent": w_cpu_percent,
+            "resident_partitions": resident_partitions,
+            "inference_latency": inference_latency,
+            "query_latency": query_latency,
+        }
+
+        # 转换列表为JSON可序列化格式
+        for key in training_data:
+            training_data[key] = [
+                float(x) if isinstance(x, (np.integer, np.floating)) else x for x in training_data[key]
+            ]
+
+        with open("model_data/training_data.json", "w") as f:
+            json.dump(training_data, f, indent=4)
+
+        # 保存完整的训练样本供可视化和分析
+        samples = []
+        for i in range(len(batch_size)):
+            samples.append(
+                {
+                    "batch_size": batch_size[i],
+                    "cache_gpu_percent": cache_gpu_percent[i],
+                    "cache_cpu_percent": cache_cpu_percent[i],
+                    "w_gpu_percent": w_gpu_percent[i],
+                    "w_cpu_percent": w_cpu_percent[i],
+                    "resident_partitions": resident_partitions[i],
+                    "inference_latency": float(inference_latency[i]),
+                    "query_latency": float(query_latency[i]),
+                    "inference_predicted": float(inf_pred[i]),
+                    "query_predicted": float(query_pred[i]),
+                    "inference_error": float(inf_pred[i] - inference_latency[i]),
+                    "query_error": float(query_pred[i] - query_latency[i]),
+                }
+            )
+
+        with open("model_data/training_samples.json", "w") as f:
+            json.dump(samples, f, indent=4)
 
         return inf_model, query_model
 
