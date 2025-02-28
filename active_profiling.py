@@ -21,6 +21,7 @@ from pymilvus import Partition
 from sklearn.model_selection import train_test_split
 from itertools import product
 
+learning_samples = 5
 
 class ActiveProfilingProcessor:
     def __init__(
@@ -47,7 +48,7 @@ class ActiveProfilingProcessor:
         self.model_config = model_config
         self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
-        self.partition_size_gb = partition_size_gb * 1.2
+        self.partition_size_gb = partition_size_gb * 1.1
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
         self.env = env
@@ -392,8 +393,8 @@ class ActiveProfilingProcessor:
         b_weight_min = -40
 
         # Combine all constraints
-        A_ub = [A_inf_latency, A_query_latency, A_weight_dist, A_cache_dist, A_gpu_mem, A_cpu_mem, A_cache_min, A_weight_min]
-        b_ub = [b_inf_latency, b_query_latency, b_weight_dist, b_cache_dist, b_gpu_mem, b_cpu_mem,]
+        A_ub = np.array([A_inf_latency, A_query_latency, A_weight_dist, A_cache_dist, A_gpu_mem, A_cpu_mem, A_cache_min, A_weight_min])
+        b_ub = np.array([b_inf_latency, b_query_latency, b_weight_dist, b_cache_dist, b_gpu_mem, b_cpu_mem, b_cache_min, b_weight_min])
 
         # Variable bounds
         # w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent >= 0
@@ -537,7 +538,7 @@ class ActiveProfilingProcessor:
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288]
+        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -576,7 +577,7 @@ class ActiveProfilingProcessor:
             max_retries = 10
 
             # Try getting an optimized config from the model if we have enough data
-            if len(training_data["batch_size"]) >= 10:
+            if len(training_data["batch_size"]) >= learning_samples:
                 # Train the cost models
                 inf_model, query_model = self.learning_cost_model(
                     training_data["batch_size"],
@@ -708,7 +709,7 @@ class ActiveProfilingProcessor:
                         best_config = result
                         cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
                         # Try using the model if we have enough data now
-                        if len(training_data["batch_size"]) >= 10:
+                        if len(training_data["batch_size"]) >= learning_samples:
                             print("Enough data for training model, trying model prediction")
                             # Update the cost models with the latest data
                             inf_model, query_model = self.learning_cost_model(

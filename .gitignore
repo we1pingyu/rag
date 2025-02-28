@@ -8,9 +8,11 @@ __pycache__
 test*.py
 logs/
 rag_data*/
-model_data*/
+model_data*/*pdf
+model_data*/*py
 *.zst
 *.gz
 *.txt
 dynagen_offload_dir/
 *_data_*/
+*copy*

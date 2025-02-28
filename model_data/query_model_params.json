@@ -1,0 +1,13 @@
+{
+    "coefficients": [
+        -24.531768644056186,
+        0.4303809526134426
+    ],
+    "intercept": 450.6500733806825,
+    "features": [
+        "resident_partitions",
+        "batch_size"
+    ],
+    "mse": 1315.2502223429979,
+    "equation": "query_latency = -24.5318 * resident_partitions + 0.4304 * batch_size + 450.6501"
+}

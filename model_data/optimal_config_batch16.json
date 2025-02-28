@@ -1,0 +1,11 @@
+{
+    "batch_size": 16,
+    "cache_gpu_percent": 0,
+    "cache_cpu_percent": 100,
+    "w_gpu_percent": 42,
+    "w_cpu_percent": 58,
+    "resident_partitions": 0,
+    "predicted_inf_latency": 43.34806537628174,
+    "predicted_query_latency": 12.587598692287102,
+    "max_latency": 43.42223996971536
+}

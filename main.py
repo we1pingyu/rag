@@ -14,8 +14,8 @@ from baseline import BaselineProcessor
 from offline import OfflineProcessor
 from dyn_offline import DynOfflineProcessor
 from active_profiling import ActiveProfilingProcessor
-from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model, build_qdrant_index
-from qdrant_client import QdrantClient
+from dyn_pipeline import DynPipelineProcessor
+from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -34,23 +34,33 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-l6-v2"
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
-    parser.add_argument("--total_questions", type=int, default=6, help="Total number of questions to process")
+    parser.add_argument("--total_questions", type=int, default=2000, help="Total number of questions to process")
     parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
     parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
-    parser.add_argument("--cpu_memory_limit", type=int, default=180, help="CPU memory limit in GB")
+    parser.add_argument("--cpu_memory_limit", type=int, default=166, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
     parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
+    parser.add_argument(
+        "--arrival_rates",
+        type=float,
+        nargs="+",
+        default=[8, 16, 32, 64],
+        help="List of arrival rates to use in dynamic pipeline",
+    )
+    parser.add_argument(
+        "--rate_change_interval", type=int, default=300, help="Interval in seconds between arrival rate changes"
+    )
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
     parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")
     parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
-    parser.add_argument("--qdrant", action="store_true", help="Use Qdrant instead of Milvus")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode")
     parser.add_argument("--offline", action="store_true", help="Run in offline mode")
     parser.add_argument("--dyn_offline", action="store_true", help="Run in offline mode with dynamic configuration")
+    parser.add_argument("--dyn_pipeline", action="store_true", help="Run in dynamic pipeline mode")
     parser.add_argument("--active", action="store_true", help="Run in active profiling mode")
     parser.add_argument(
         "--percent",
@@ -77,47 +87,37 @@ if __name__ == "__main__":
                 "batch_size": MAX_BATCH_SIZE,
             },
         )
-        if args.qdrant:
-            client = build_qdrant_index(
-                persist_directory=args.persist_dir, num_partitions=args.num_partitions, embedding_model=embedding_model
-            )
-        else:
-            build_index(
-                persist_directory=args.persist_dir,
-                num_partitions=args.num_partitions,
-                embedding_model=embedding_model,
-                dataset=args.dataset,
-            )
+        build_index(
+            persist_directory=args.persist_dir,
+            num_partitions=args.num_partitions,
+            embedding_model=embedding_model,
+            dataset=args.dataset,
+        )
         print("Index building completed")
 
-    if args.qdrant:
-        print("Connecting to Qdrant...")
-        client = QdrantClient("localhost", port=6333)
-    else:
-        print("Connecting to Milvus...")
-        connections.connect(host="localhost", port="19530")
-        collection = Collection(f"{args.dataset}_collection")
-        collection.release()
+    print("Connecting to Milvus...")
+    connections.connect(host="localhost", port="19530")
+    collection = Collection(f"{args.dataset}_collection")
+    collection.release()
 
     try:
-        if not args.qdrant:
-            total_gpu_memory = 24
-            fraction = args.gpu_memory_limit / total_gpu_memory
-            print(f"Setting GPU memory fraction to {fraction}")
-            torch.cuda.set_per_process_memory_fraction(fraction)
+        total_gpu_memory = 24
+        fraction = args.gpu_memory_limit / total_gpu_memory
+        print(f"Setting GPU memory fraction to {fraction}")
+        torch.cuda.set_per_process_memory_fraction(fraction)
 
-            collection.load(["partition_0"])
-            print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
-            partition_size_gb = get_milvus_memory_usage()
-            available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
-            resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
-            print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
+        collection.load(["partition_0"])
+        print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
+        partition_size_gb = get_milvus_memory_usage()
+        available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
+        resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
+        print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
 
-            # 加载 resident partitions
-            if args.resident_partitions > 0:
-                resident_partition_names = [f"partition_{i}" for i in range(args.resident_partitions)]
-                collection.load(resident_partition_names)
-                print(f"Loaded {args.resident_partitions} resident partitions: {resident_partition_names}")
+        # 加载 resident partitions
+        if args.resident_partitions > 0:
+            resident_partition_names = [f"partition_{i}" for i in range(args.resident_partitions)]
+            collection.load(resident_partition_names)
+            print(f"Loaded {args.resident_partitions} resident partitions: {resident_partition_names}")
         print("Loading models and initializing...")
         # Load LLM
         model_name = args.model
@@ -180,7 +180,40 @@ if __name__ == "__main__":
 
         timing_stats = {}
         total_start_time = time.time()
-        if args.offline:
+        if args.dyn_pipeline:
+            print("\nRunning in dynamic pipeline mode")
+            processor = DynPipelineProcessor(
+                questions=all_questions[:2000],
+                batch_size=args.batch_size,
+                arrival_rates=[2, 4, 8],
+                embedding_model=embedding_model,
+                model=model,
+                tokenizer=tokenizer,
+                collection=collection,
+                partition_names=partition_names,
+                timing_stats=timing_stats,
+                resident_partitions=args.resident_partitions,
+                base_time=total_start_time,
+                dynagen=args.dynagen,
+                rate_change_interval=600,
+                partition_size_gb=partition_size_gb,
+                model_config=model_config,
+                total_cpu_gb=available_cpu_mem,
+                gpu_memory_gb=args.gpu_memory_limit,
+                env=env if args.dynagen else None,
+            )
+
+            if args.dynagen and model_config:
+                processor.run(
+                    model_config=model_config,
+                    total_cpu_gb=available_cpu_mem,
+                    gpu_memory_gb=args.gpu_memory_limit,
+                    partition_size_gb=partition_size_gb,
+                )
+            else:
+                print("Error: DynPipeline requires DynaGen and model_config")
+                exit(1)
+        elif args.offline:
             print("\nRunning in offline mode (batch processing)")
             processor = OfflineProcessor(
                 questions=all_questions[: args.total_questions],
@@ -221,10 +254,9 @@ if __name__ == "__main__":
                 embedding_model=embedding_model,
                 model=model,
                 tokenizer=tokenizer,
-                collection=client if args.qdrant else collection,
+                collection=collection,
                 partition_names=partition_names,
                 resident_partitions=args.resident_partitions,
-                use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
                 cache_gpu_percent=args.percent[2],
                 cache_cpu_percent=args.percent[3],
@@ -239,12 +271,11 @@ if __name__ == "__main__":
                 embedding_model=embedding_model,
                 model=model,
                 tokenizer=tokenizer,
-                collection=client if args.qdrant else collection,
+                collection=collection,
                 partition_names=partition_names,
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
-                use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
                 env=env if args.dynagen else None,
             )
@@ -257,12 +288,11 @@ if __name__ == "__main__":
                 embedding_model=embedding_model,
                 model=model,
                 tokenizer=tokenizer,
-                collection=client if args.qdrant else collection,
+                collection=collection,
                 partition_names=partition_names,
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
-                use_qdrant=args.qdrant,
                 dynagen=args.dynagen,
             )
 
@@ -316,8 +346,8 @@ if __name__ == "__main__":
                     print(f"Q: {result['question'].question_text}")
                     print(f"A: {result['result']['llm_response']}")
                     print(f"Retrieved Doc IDs: {result['result']['metadata']['doc_ids']}")
-                    print(f"Arrival time: {result['arrival_time'] - processor .base_time:.2f}s")
-                    print(f"Completion time: {result['completion_time'] - processor .base_time:.2f}s")
+                    print(f"Arrival time: {result['arrival_time'] - processor.base_time:.2f}s")
+                    print(f"Completion time: {result['completion_time'] - processor.base_time:.2f}s")
                     print(f"Processing time: {result['completion_time'] - result['arrival_time']:.2f}s")
                     print("-" * 40)
 
@@ -339,9 +369,8 @@ if __name__ == "__main__":
 
     finally:
         print("\nCleaning up...")
-        if not args.qdrant:
-            collection.release()
-            connections.disconnect("default")
+        collection.release()
+        connections.disconnect("default")
         if args.dynagen:
             if os.path.exists("./dynagen_offload_dir"):
                 shutil.rmtree("./dynagen_offload_dir")
