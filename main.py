@@ -15,6 +15,7 @@ from offline import OfflineProcessor
 from dyn_offline import DynOfflineProcessor
 from active_profiling import ActiveProfilingProcessor
 from dyn_pipeline import DynPipelineProcessor
+from efficient_rag import VLLMProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model
 
 
@@ -35,7 +36,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run pipeline RAG processing")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="LLM Model name")
     parser.add_argument("--total_questions", type=int, default=2000, help="Total number of questions to process")
-    parser.add_argument("--batch_size", type=int, default=2, help="Number of questions to process per batch")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of questions to process per batch")
     parser.add_argument("--persist_dir", type=str, default="trivia_data_milvus", help="Directory for persisted data")
     parser.add_argument("--dataset", type=str, default="trivia", help="Dataset to use for rag: nq or trivia or macro")
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
@@ -62,11 +63,12 @@ if __name__ == "__main__":
     parser.add_argument("--dyn_offline", action="store_true", help="Run in offline mode with dynamic configuration")
     parser.add_argument("--dyn_pipeline", action="store_true", help="Run in dynamic pipeline mode")
     parser.add_argument("--active", action="store_true", help="Run in active profiling mode")
+    parser.add_argument("--vllm", action="store_true", help="Run with VLLM for efficient generation")
     parser.add_argument(
         "--percent",
         nargs="+",
         type=int,
-        default=[0, 11, 66, 0],
+        default=[20, 20, 20, 20],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
@@ -145,14 +147,12 @@ if __name__ == "__main__":
                 pad_token_id=tokenizer.pad_token_id,
             )
             torch.cuda.empty_cache()
-        else:
+        elif not args.vllm:
             print("\nInitializing HF model...")
-            max_memory_per_batch = 1.5  # GiB per batch
+            max_memory_per_batch = 0.25  # GiB per batch
             total_memory = args.gpu_memory_limit  # Total available memory in GiB
-
             # Calculate remaining memory after accounting for batch size
             max_memory_size = total_memory - (args.batch_size * max_memory_per_batch)
-
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
@@ -183,9 +183,31 @@ if __name__ == "__main__":
         if args.dyn_pipeline:
             print("\nRunning in dynamic pipeline mode")
             processor = DynPipelineProcessor(
-                questions=all_questions[:2000],
+                questions=all_questions[: args.total_questions],
                 batch_size=args.batch_size,
-                arrival_rates=[2, 4, 8],
+                arrival_rates=[4],
+                embedding_model=embedding_model,
+                model=model,
+                tokenizer=tokenizer,
+                collection=collection,
+                partition_names=["partition_0"],
+                timing_stats=timing_stats,
+                resident_partitions=args.resident_partitions,
+                base_time=total_start_time,
+                rate_change_interval=60,
+                partition_size_gb=partition_size_gb,
+                model_config=model_config,
+                total_cpu_gb=available_cpu_mem,
+                gpu_memory_gb=args.gpu_memory_limit,
+                env=env,
+            )
+        elif args.baseline:
+            print("\nRunning in baseline (serial) mode")
+            processor = BaselineProcessor(
+                questions=all_questions[: args.total_questions],
+                batch_size=args.batch_size,
+                arrival_rates=[2],
+                rate_change_interval=60,
                 embedding_model=embedding_model,
                 model=model,
                 tokenizer=tokenizer,
@@ -194,25 +216,27 @@ if __name__ == "__main__":
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
-                dynagen=args.dynagen,
-                rate_change_interval=600,
-                partition_size_gb=partition_size_gb,
-                model_config=model_config,
-                total_cpu_gb=available_cpu_mem,
-                gpu_memory_gb=args.gpu_memory_limit,
-                env=env if args.dynagen else None,
+                dynagen=False,
             )
-
-            if args.dynagen and model_config:
-                processor.run(
-                    model_config=model_config,
-                    total_cpu_gb=available_cpu_mem,
-                    gpu_memory_gb=args.gpu_memory_limit,
-                    partition_size_gb=partition_size_gb,
-                )
-            else:
-                print("Error: DynPipeline requires DynaGen and model_config")
-                exit(1)
+        elif args.vllm:
+            print("\nRunning with VLLM processor")
+            processor = VLLMProcessor(
+                questions=all_questions[: args.total_questions],
+                batch_size=args.batch_size,
+                arrival_rates=[4],
+                rate_change_interval=60,
+                embedding_model=embedding_model,
+                model_name=args.model,  # Pass model name instead of model instance
+                tokenizer=tokenizer,
+                collection=collection,
+                partition_names=["partition_0"],
+                timing_stats=timing_stats,
+                resident_partitions=args.resident_partitions,
+                base_time=total_start_time,
+                max_new_tokens=16,  # Adjustable parameter
+                gpu_memory_utilization=0.5,  # Adjustable parameter
+                vllm_batch_size=args.batch_size,  # Can be different from query batch size
+            )
         elif args.offline:
             print("\nRunning in offline mode (batch processing)")
             processor = OfflineProcessor(
@@ -262,23 +286,7 @@ if __name__ == "__main__":
                 cache_cpu_percent=args.percent[3],
                 env=env,
             )
-        elif args.baseline:
-            print("\nRunning in baseline (serial) mode")
-            processor = BaselineProcessor(
-                questions=all_questions[: args.total_questions],
-                batch_size=args.batch_size,
-                arrival_rate=args.arrival_rate,
-                embedding_model=embedding_model,
-                model=model,
-                tokenizer=tokenizer,
-                collection=collection,
-                partition_names=partition_names,
-                timing_stats=timing_stats,
-                resident_partitions=args.resident_partitions,
-                base_time=total_start_time,
-                dynagen=args.dynagen,
-                env=env if args.dynagen else None,
-            )
+
         else:
             # Initialize pipeline manager
             processor = PipelineProcessor(
@@ -301,37 +309,13 @@ if __name__ == "__main__":
             print(f"Total questions: {len(all_questions[:args.total_questions])}")
             print(f"Batch size: {args.batch_size}")
         if not args.offline and not args.dyn_offline and not args.active:
-            print(f"Average arrival rate: {args.arrival_rate} questions/minute")
             print(f"Expected duration: {processor.expected_duration:.2f} seconds")
 
         # Run pipeline
         if args.active:
             optimal_configs = processor.run()
-        elif args.dyn_offline:
-            processor.run(
-                experiment_config=[
-                    {
-                        "batch_size": args.batch_size,
-                        "cache_gpu_percent": 80,
-                        "cache_cpu_percent": 20,
-                        "resident_partitions": 1,  # New parameter
-                    },
-                    {
-                        "batch_size": args.batch_size + 1,
-                        "cache_gpu_percent": 50,
-                        "cache_cpu_percent": 50,
-                        "resident_partitions": 2,  # Will release partitions 4 and 3
-                    },
-                    {
-                        "batch_size": args.batch_size + 2,
-                        "cache_gpu_percent": 0,
-                        "cache_cpu_percent": 20,
-                        "resident_partitions": 3,  # Will load partitions 6 and 5
-                    },
-                ]
-            )
-        else:
-            processor.run()
+
+        processor.run()
 
         if not args.active:
             sorted_results = processor.get_sorted_results()

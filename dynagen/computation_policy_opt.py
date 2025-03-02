@@ -51,55 +51,74 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
         raise NotImplementedError()
 
     def generation_loop_overlap_single_batch(self, this, evaluate):
-        # Implementation remains unchanged
-        def load_layer_weight(i, j):
-            this.load_weight(i, j, 0, overlap=False)
+        # Helper functions for asynchronous operations
+        def load_weight_async(i, j):
+            return this.cache_loader.load_cache(True, lambda: this.load_weight(i, j, 0, overlap=False))
 
-        def load_layer_cache(i, j, k, load_to_cpu=False):
-            this.load_cache_dyn(i, j, k, load_to_cpu=load_to_cpu)
+        def load_cache_async(i, j):
+            return this.cache_loader.load_cache(True, lambda: this.load_cache_dyn(i, j, 0, load_to_cpu=False))
 
-        def compute_layer(i, j, layers_weights_sync, layers_cache_sync):
-            wait_stream_finish(layers_weights_sync[j])
-            layers_weights_sync[j] = None
-            if this.layers[j].need_cache:
-                wait_stream_finish(layers_cache_sync[j])
-            layers_cache_sync[j] = None
-            cpu_del = j % 4 == 1
-            this.load_hidden(i, j, 0)
-            this.compute_layer(i, j, 0, cpu_delegation=None)
-            if j == this.num_layers - 1:
-                this.sync()
-            this.store_cache(i, j - 1, 0)
-            this.store_hidden(i, j, 0)
-            this.sync()
+        # Create prefetching buffers
+        weight_futures = [None for _ in range(this.num_layers)]
+        cache_futures = [None for _ in range(this.num_layers)]
 
-        layers_weights_sync = [None for _ in range(this.num_layers)]
-        layers_cache_sync = [None for _ in range(this.num_layers)]
-        f = this.cache_loader.load_cache(True, load_layer_weight, 0, 0)
-        layers_weights_sync[0] = f
+        # Initialize with first layer weight
+        weight_futures[0] = load_weight_async(0, 0)
         this.sync()
+
+        # Main generation loop
         for i in tqdm(range(this.execute_gen_len), desc="Generating"):
             this.update_attention_mask(i, 0)
-            for j in range(this.num_layers):
-                loading_weights = sum(x is not None for x in layers_weights_sync)
-                loading_caches = sum(x is not None for x in layers_cache_sync)
-                step = j + 2 if i == 0 else j + 10
-                for l in range(j + 1, step):
-                    layer = l
-                    token = i
-                    if layer >= this.num_layers:
-                        layer = layer - this.num_layers
-                        token = i + 1
-                    if token >= this.execute_gen_len:
-                        continue
-                    if layers_weights_sync[layer] is None and loading_weights <= 3:
-                        f = this.cache_loader.load_cache(True, load_layer_weight, token, layer)
-                        layers_weights_sync[layer] = f
-                    if layers_cache_sync[layer] is None and loading_caches <= 3:
-                        f = this.cache_loader.load_cache(True, load_layer_cache, token, layer, 0, 0)
-                        layers_cache_sync[layer] = f
 
-                compute_layer(i, j, layers_weights_sync, layers_cache_sync)
+            for j in range(this.num_layers):
+                # Prefetch weights and caches for upcoming layers
+                prefetch_distance = 1 if i == 0 else 1
+
+                for offset in range(1, prefetch_distance + 1):
+                    next_j = j + offset
+                    next_i = i
+
+                    # Handle wrap-around for layer index
+                    if next_j >= this.num_layers:
+                        next_j = next_j - this.num_layers
+                        next_i = i + 1
+
+                    # Skip if beyond generation length
+                    if next_i >= this.execute_gen_len:
+                        continue
+
+                    # Limit number of concurrent prefetches
+                    loading_weights = sum(x is not None for x in weight_futures)
+                    loading_caches = sum(x is not None for x in cache_futures)
+
+                    # Prefetch weight if slot is empty and not too many already loading
+                    if weight_futures[next_j] is None and loading_weights <= prefetch_distance:
+                        weight_futures[next_j] = load_weight_async(next_i, next_j)
+
+                    # Prefetch cache if slot is empty and not too many already loading
+                    if cache_futures[next_j] is None and loading_caches <= prefetch_distance:
+                        cache_futures[next_j] = load_cache_async(next_i, next_j)
+
+                # Wait for current weight and cache to be ready
+                if weight_futures[j] is not None:
+                    wait_stream_finish(weight_futures[j])
+                    weight_futures[j] = None
+
+                if this.layers[j].need_cache and cache_futures[j] is not None:
+                    wait_stream_finish(cache_futures[j])
+                cache_futures[j] = None
+
+                # Compute current layer
+                this.load_hidden(i, j, 0)
+                this.compute_layer(i, j, 0, cpu_delegation=None)
+
+                if j == this.num_layers - 1:
+                    this.sync()
+
+                this.store_cache(i, j - 1, 0)
+                this.store_hidden(i, j, 0)
+                this.sync()
+
                 if i == 0:
                     this.sync()
 
@@ -137,7 +156,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     if i==0:
                         prefetch_distance = 1  # How many steps ahead to prefetch
                     else:
-                        prefetch_distance = 4  # How many steps ahead to prefetch
+                        prefetch_distance = 1  # How many steps ahead to prefetch
 
                     # Prefetch weights for upcoming operations
                     for offset in range(1, prefetch_distance + 1):
@@ -176,7 +195,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     this.load_hidden(i, j, k + 1)
                     this.compute_layer(i, j, k)
                     this.store_cache(i, j, k - 1, overlap=False)
-                    this.sync()
+                    # this.sync()
 
             # Check for early stopping condition
             if this.task.stop and np.all(this.stopped):

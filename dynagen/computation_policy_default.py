@@ -147,8 +147,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
                     break
                 this.store_cache(i, j - 1, 0, overlap=False)
                 this.store_hidden(i, j, 0)
-
-                this.sync()
+                # this.sync()
             timers("generate").stop()
 
             if this.task.stop and np.all(this.stopped):

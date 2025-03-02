@@ -38,7 +38,6 @@ class DynPipelineProcessor:
         timing_stats: Dict[str, List[float]] = None,
         resident_partitions: int = 0,
         base_time: float = None,
-        dynagen: bool = False,
         rate_change_interval: int = 600,  # 10 minutes in seconds
         env=None,
         seed: int = 42,
@@ -100,7 +99,6 @@ class DynPipelineProcessor:
         np.random.seed(seed)
         self.all_results = []
         self.results_lock = Lock()
-        self.dynagen = dynagen
         self.loaded_partitions = set([0])  # Start with partition_0 loaded
 
         # Track questions by interval
@@ -868,7 +866,7 @@ class DynPipelineProcessor:
                         max_new_tokens=16,
                         batch_size=chosen_batch_size,
                         timing_stats=self.timing_stats,
-                        dynagen=self.dynagen,
+                        dynagen=True,
                         env=self.env,
                     )
                     self.timing_stats.update(updated_timing_stats)
