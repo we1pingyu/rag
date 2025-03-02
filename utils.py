@@ -508,12 +508,12 @@ def batch_query(
     # Process each partition
     for partition_name in tqdm(partition_names, desc="Querying"):
         # Only load if it's not a resident partition
-        if partition_name not in partition_names[:resident_partitions]:
-            load_start = time.time()
-            # print(f"Loading partition {partition_name}")
-            collection.load(partition_names=[partition_name])
-            # print(f"Loaded partition {partition_name} {get_milvus_memory_usage():.2f} GB")
-            log_timing(timing_stats, "partition_load_time", time.time() - load_start)
+        # if partition_name not in partition_names[:resident_partitions]:
+        load_start = time.time()
+        # print(f"Loading partition {partition_name}")
+        collection.load(partition_names=[partition_name])
+        # print(f"Loaded partition {partition_name} {get_milvus_memory_usage():.2f} GB")
+        log_timing(timing_stats, "partition_load_time", time.time() - load_start)
 
         search_start = time.time()
         partition_search_results = collection.search(

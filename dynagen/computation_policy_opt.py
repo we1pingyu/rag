@@ -72,7 +72,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
             for j in range(this.num_layers):
                 # Prefetch weights and caches for upcoming layers
-                prefetch_distance = 1 if i == 0 else 1
+                prefetch_distance = 2 if i == 0 else 2
 
                 for offset in range(1, prefetch_distance + 1):
                     next_j = j + offset
@@ -101,10 +101,12 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
                 # Wait for current weight and cache to be ready
                 if weight_futures[j] is not None:
+                    this.env.disk.synchronize()
                     wait_stream_finish(weight_futures[j])
                     weight_futures[j] = None
 
                 if this.layers[j].need_cache and cache_futures[j] is not None:
+                    this.env.disk.synchronize()
                     wait_stream_finish(cache_futures[j])
                 cache_futures[j] = None
 
@@ -153,7 +155,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                 # Process each batch
                 for k in range(this.num_gpu_batches):
                     # Prefetch weights and cache for next operations with a simple sliding window
-                    if i==0:
+                    if i == 0:
                         prefetch_distance = 1  # How many steps ahead to prefetch
                     else:
                         prefetch_distance = 1  # How many steps ahead to prefetch
@@ -183,10 +185,12 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
                     # Wait for current weight and cache to be ready
                     if weight_futures[k][j] is not None:
+                        this.env.disk.synchronize()
                         wait_stream_finish(weight_futures[k][j])
                         weight_futures[k][j] = None
 
                     if cache_futures[k][j] is not None:
+                        this.env.disk.synchronize()
                         wait_stream_finish(cache_futures[k][j])
                         cache_futures[k][j] = None
 
