@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from utils import Question, log_timing, batch_query, batch_generate_responses
-
+from transformers import AutoModelForCausalLM
 
 class BaselineProcessor:
 
@@ -15,15 +15,14 @@ class BaselineProcessor:
         arrival_rates: List[float],  # 每分钟的问题数（多个）
         rate_change_interval: int,  # 间隔时间（秒）
         embedding_model,
-        model,
+        model_name,
         tokenizer,
         collection,
         partition_names: List[str],
         timing_stats: Dict[str, List[float]],
+        gpu_memory_gb: int,
         resident_partitions: int = 0,
         base_time: float = None,
-        dynagen: bool = False,
-        env=None,
         seed: int = 42,
     ):
         self.questions = [
@@ -33,7 +32,14 @@ class BaselineProcessor:
         self.arrival_rates = arrival_rates if arrival_rates else [16]  # 默认单一到达率
         self.rate_change_interval = rate_change_interval
         self.embedding_model = embedding_model
-        self.model = model
+        max_memory_per_batch = 0.25  # GiB per batch
+        # Calculate remaining memory after accounting for batch size
+        max_gpu_memory_size = gpu_memory_gb - (self.batch_size * max_memory_per_batch)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            max_memory={0: f"{max_gpu_memory_size}GiB"},
+        )
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
@@ -41,8 +47,6 @@ class BaselineProcessor:
         self.resident_partitions = resident_partitions
         self.base_time = base_time if base_time else time.time()
         self.results = []
-        self.dynagen = dynagen
-        self.env = env
 
         # 新增的间隔跟踪变量
         self.interval_question_count = []

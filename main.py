@@ -9,14 +9,11 @@ import warnings
 import shutil
 from pathlib import Path
 from pymilvus import connections, Collection
-from pipeline import PipelineProcessor
 from baseline import BaselineProcessor
-from offline import OfflineProcessor
-from dyn_offline import DynOfflineProcessor
 from active_profiling import ActiveProfilingProcessor
 from dyn_pipeline import DynPipelineProcessor
 from efficient_rag import VLLMProcessor
-from utils import build_index, get_milvus_memory_usage, calculate_latency_stats, init_dynagen_model
+from utils import build_index, get_milvus_memory_usage, calculate_latency_stats
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -24,7 +21,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", module="langchain")
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from langchain_huggingface import HuggingFaceEmbeddings
 
 MAX_BATCH_SIZE = 65536
@@ -43,7 +40,6 @@ if __name__ == "__main__":
     parser.add_argument("--cpu_memory_limit", type=int, default=166, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
     parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
-    parser.add_argument("--arrival_rate", type=float, default=16, help="Number of questions arriving per minute")
     parser.add_argument(
         "--arrival_rates",
         type=float,
@@ -56,14 +52,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--build_index", action="store_true", help="Whether to build Milvus index")
     parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")
-    parser.add_argument("--dynagen", action="store_true", help="Whether to use DynaGen for generation")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode")
-    parser.add_argument("--offline", action="store_true", help="Run in offline mode")
-    parser.add_argument("--dyn_offline", action="store_true", help="Run in offline mode with dynamic configuration")
-    parser.add_argument("--dyn_pipeline", action="store_true", help="Run in dynamic pipeline mode")
-    parser.add_argument("--active", action="store_true", help="Run in active profiling mode")
-    parser.add_argument("--vllm", action="store_true", help="Run with VLLM for efficient generation")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode with HF transformer")
+    mode_group.add_argument(
+        "--dyn_pipeline", action="store_true", help="Run in dynamic pipeline mode with dynagen model"
+    )
+    mode_group.add_argument("--vllm", action="store_true", help="Run with VLLM for efficient generation")
+    mode_group.add_argument("--active", action="store_true", help="Run in active profiling mode with dynagen model")
     parser.add_argument(
         "--percent",
         nargs="+",
@@ -122,42 +118,10 @@ if __name__ == "__main__":
             print(f"Loaded {args.resident_partitions} resident partitions: {resident_partition_names}")
         print("Loading models and initializing...")
         # Load LLM
-        model_name = args.model
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
-        if args.dynagen:
-            print("\nInitializing DynaGen model...")
-            model, model_config, env = init_dynagen_model(model_name, tokenizer, args)
-            dummy_text = ["Hello world"] * 4  # Simple warmup text
-            dummy_input = tokenizer(
-                dummy_text,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=512,
-                padding_side="left",
-            ).input_ids
-            # Perform warmup
-            model.generate(
-                dummy_input,
-                do_sample=False,
-                max_new_tokens=1,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            torch.cuda.empty_cache()
-        elif not args.vllm:
-            print("\nInitializing HF model...")
-            max_memory_per_batch = 0.25  # GiB per batch
-            total_memory = args.gpu_memory_limit  # Total available memory in GiB
-            # Calculate remaining memory after accounting for batch size
-            max_memory_size = total_memory - (args.batch_size * max_memory_per_batch)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                max_memory={0: f"{max_memory_size}GiB"},
-            )
 
         # Load embedding model
         embedding_model = HuggingFaceEmbeddings(
@@ -187,7 +151,7 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 arrival_rates=[8],
                 embedding_model=embedding_model,
-                model=model,
+                model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
                 partition_names=partition_names,
@@ -196,10 +160,8 @@ if __name__ == "__main__":
                 base_time=total_start_time,
                 rate_change_interval=600,
                 partition_size_gb=partition_size_gb,
-                model_config=model_config,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
-                env=env,
             )
         elif args.baseline:
             print("\nRunning in baseline (serial) mode")
@@ -209,14 +171,14 @@ if __name__ == "__main__":
                 arrival_rates=[2],
                 rate_change_interval=60,
                 embedding_model=embedding_model,
-                model=model,
+                model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
                 partition_names=partition_names,
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
-                dynagen=False,
+                gpu_memory_gb=args.gpu_memory_limit,
             )
         elif args.vllm:
             print("\nRunning with VLLM processor")
@@ -237,78 +199,23 @@ if __name__ == "__main__":
                 gpu_memory_utilization=0.5,  # Adjustable parameter
                 vllm_batch_size=args.batch_size,  # Can be different from query batch size
             )
-        elif args.offline:
-            print("\nRunning in offline mode (batch processing)")
-            processor = OfflineProcessor(
-                questions=all_questions[: args.total_questions],
-                batch_size=args.batch_size,
-                embedding_model=embedding_model,
-                model=model,
-                tokenizer=tokenizer,
-                collection=collection,
-                partition_names=["partition_0"],
-                w_gpu_percent=args.percent[0],
-                w_cpu_percent=args.percent[1],
-                cache_gpu_percent=args.percent[2],
-                cache_cpu_percent=args.percent[3],
-                resident_partitions=args.resident_partitions,
-                dynagen=args.dynagen,
-                env=env,
-            )
         elif args.active:
             processor = ActiveProfilingProcessor(
                 questions=all_questions,
                 embedding_model=embedding_model,
-                model=model,
+                model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
                 partition_names=partition_names,
                 partition_size_gb=partition_size_gb,
-                model_config=model_config,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
-                env=env,
-            )
-
-        elif args.dyn_offline:
-            print("\nRunning in offline mode with dynamic configuration")
-            processor = DynOfflineProcessor(
-                questions=all_questions[: args.total_questions],
-                batch_size=args.batch_size,
-                embedding_model=embedding_model,
-                model=model,
-                tokenizer=tokenizer,
-                collection=collection,
-                partition_names=partition_names,
-                resident_partitions=args.resident_partitions,
-                dynagen=args.dynagen,
-                cache_gpu_percent=args.percent[2],
-                cache_cpu_percent=args.percent[3],
-                env=env,
-            )
-
-        else:
-            # Initialize pipeline manager
-            processor = PipelineProcessor(
-                questions=all_questions[: args.total_questions],
-                batch_size=args.batch_size,
-                arrival_rate=args.arrival_rate,
-                embedding_model=embedding_model,
-                model=model,
-                tokenizer=tokenizer,
-                collection=collection,
-                partition_names=partition_names,
-                timing_stats=timing_stats,
-                resident_partitions=args.resident_partitions,
-                base_time=total_start_time,
-                dynagen=args.dynagen,
             )
 
         if not args.active:
             print(f"\nStarting processing:")
             print(f"Total questions: {len(all_questions[:args.total_questions])}")
             print(f"Batch size: {args.batch_size}")
-        if not args.offline and not args.dyn_offline and not args.active:
             print(f"Expected duration: {processor.expected_duration:.2f} seconds")
 
         # Run pipeline
@@ -342,20 +249,11 @@ if __name__ == "__main__":
 
             # Print final statistics
             total_time = time.time() - total_start_time
-            # print("\nTiming Statistics:")
-            # category_totals = {}
-            # for key, times in timing_stats.items():
-            #     category_totals[key] = sum(times)
-            #     print(f"{key}:")
-            #     print(f"  Total time: {category_totals[key]:.3f}s")
-            #     print(f"  Percentage of total: {(category_totals[key]/total_time)*100:.1f}%")
             print(f"\nTotal end-to-end time: {total_time:.3f}s")
 
     finally:
         print("\nCleaning up...")
         collection.release()
         connections.disconnect("default")
-        if args.dynagen:
-            if os.path.exists("./dynagen_offload_dir"):
-                shutil.rmtree("./dynagen_offload_dir")
-            env.close_copy_threads()
+        if os.path.exists("./dynagen_offload_dir"):
+            shutil.rmtree("./dynagen_offload_dir")

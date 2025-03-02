@@ -16,42 +16,40 @@ from scipy.optimize import linprog
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
-from utils import batch_query, batch_generate_responses, split_batch
+from utils import batch_query, batch_generate_responses, split_batch, init_dynagen_model
 from pymilvus import Partition
 from sklearn.model_selection import train_test_split
 from itertools import product
 
 learning_samples = 5
 
+
 class ActiveProfilingProcessor:
     def __init__(
         self,
         questions: List[Dict],
         embedding_model,
-        model,
+        model_name,
         tokenizer,
         collection,
         partition_size_gb: float,
-        model_config,
         partition_names: List[str],
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
         safety_margin: float = 0.7,
-        env=None,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
-        self.model = model
+        self.model_name = model_name
+        self.model, self.model_config, self.env = init_dynagen_model(model_name, tokenizer, [20, 20, 20, 20])
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
-        self.model_config = model_config
         self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
         self.partition_size_gb = partition_size_gb * 1.1
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
-        self.env = env
 
         # Get model requirements
         self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
@@ -393,8 +391,30 @@ class ActiveProfilingProcessor:
         b_weight_min = -40
 
         # Combine all constraints
-        A_ub = np.array([A_inf_latency, A_query_latency, A_weight_dist, A_cache_dist, A_gpu_mem, A_cpu_mem, A_cache_min, A_weight_min])
-        b_ub = np.array([b_inf_latency, b_query_latency, b_weight_dist, b_cache_dist, b_gpu_mem, b_cpu_mem, b_cache_min, b_weight_min])
+        A_ub = np.array(
+            [
+                A_inf_latency,
+                A_query_latency,
+                A_weight_dist,
+                A_cache_dist,
+                A_gpu_mem,
+                A_cpu_mem,
+                A_cache_min,
+                A_weight_min,
+            ]
+        )
+        b_ub = np.array(
+            [
+                b_inf_latency,
+                b_query_latency,
+                b_weight_dist,
+                b_cache_dist,
+                b_gpu_mem,
+                b_cpu_mem,
+                b_cache_min,
+                b_weight_min,
+            ]
+        )
 
         # Variable bounds
         # w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent >= 0
@@ -453,11 +473,11 @@ class ActiveProfilingProcessor:
                     "max_latency": float(max_latency),
                 }
 
-                os.makedirs("model_data", exist_ok=True)
+                os.makedirs(f"{self.model_name}", exist_ok=True)
 
                 # Save the optimal configuration for this batch size
-                config_file = f"model_data/optimal_config_batch{batch_size}.json"
-                all_configs_file = "model_data/all_optimal_configs.json"
+                config_file = f"{self.model_name}/optimal_config_batch{batch_size}.json"
+                all_configs_file = f"{self.model_name}/all_optimal_configs.json"
 
                 with open(config_file, "w") as f:
                     json.dump(best_config, f, indent=4)

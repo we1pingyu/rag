@@ -88,7 +88,7 @@ def split_batch(batch_size, max_split_size=32):
     return None
 
 
-def init_dynagen_model(model_name, tokenizer, args):
+def init_dynagen_model(model_name, tokenizer, percent):
     """Initialize dynagen Llama model with specified configuration"""
     gpu = LlamaTorchDevice("cuda:0")
     cpu = LlamaTorchDevice("cpu")
@@ -103,10 +103,10 @@ def init_dynagen_model(model_name, tokenizer, args):
     policy = Policy(
         gpu_batch_size=4,
         num_gpu_batches=1,
-        w_gpu_percent=args.percent[0],  # Store all weights on GPU
-        w_cpu_percent=args.percent[1],
-        cache_gpu_percent=args.percent[2],  # Store all cache on GPU
-        cache_cpu_percent=args.percent[3],
+        w_gpu_percent=percent[0],  # Store all weights on GPU
+        w_cpu_percent=percent[1],
+        cache_gpu_percent=percent[2],  # Store all cache on GPU
+        cache_cpu_percent=percent[3],
         act_gpu_percent=100,  # Store all activations on GPU
         act_cpu_percent=0,
         overlap=True,

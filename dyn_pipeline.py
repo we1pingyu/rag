@@ -14,6 +14,7 @@ from utils import (
     batch_generate_responses,
     print_memory_usage,
     split_batch,
+    init_dynagen_model,
 )
 from scipy.optimize import linprog
 from pymilvus import Partition
@@ -25,13 +26,12 @@ class DynPipelineProcessor:
         self,
         questions: List[Dict],
         batch_size: int,
-        arrival_rates: List[float] = None,
-        embedding_model=None,
-        model=None,
+        arrival_rates: List[float],
+        embedding_model,
+        model_name,
         tokenizer=None,
         collection=None,
         partition_size_gb: float = 11.0,
-        model_config=None,
         partition_names: List[str] = None,
         total_cpu_gb: int = 166,
         gpu_memory_gb: int = 12,
@@ -39,7 +39,6 @@ class DynPipelineProcessor:
         resident_partitions: int = 0,
         base_time: float = None,
         rate_change_interval: int = 600,  # 10 minutes in seconds
-        env=None,
         seed: int = 42,
     ):
         self.questions = [
@@ -49,7 +48,8 @@ class DynPipelineProcessor:
         self.arrival_rates = arrival_rates if arrival_rates else [16, 32, 64]
         self.rate_change_interval = rate_change_interval
         self.embedding_model = embedding_model
-        self.model = model
+        self.model_name = model_name
+        self.model, self.model_config, self.env = init_dynagen_model(model_name, tokenizer, [20, 20, 20, 20])
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
@@ -61,10 +61,8 @@ class DynPipelineProcessor:
         self.total_cpu_gb = total_cpu_gb
         self.gpu_memory_gb = gpu_memory_gb
         self.partition_size_gb = partition_size_gb
-        self.model_config = model_config
         self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
         self.compute_weight_gb = self.total_weight_gb / self.model_config.num_hidden_layers
-        self.env = env
 
         # Queues and state management
         self.question_queue = Queue()
@@ -93,8 +91,8 @@ class DynPipelineProcessor:
         }
 
         # Get or load model parameters
-        self.inf_model_params = self._load_model_params("model_data/inference_model_params.json")
-        self.query_model_params = self._load_model_params("model_data/query_model_params.json")
+        self.inf_model_params = self._load_model_params(f"{self.model_name}/inference_model_params.json")
+        self.query_model_params = self._load_model_params(f"{self.model_name}/query_model_params.json")
 
         np.random.seed(seed)
         self.all_results = []
