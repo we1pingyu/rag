@@ -91,8 +91,8 @@ class DynPipelineProcessor:
         }
 
         # Get or load model parameters
-        self.inf_model_params = self._load_model_params(f"{self.model_name+"_data"}/inference_model_params.json")
-        self.query_model_params = self._load_model_params(f"{self.model_name+"_data"}/query_model_params.json")
+        self.inf_model_params = self._load_model_params(f"{self.model_name}_data/inference_model_params.json")
+        self.query_model_params = self._load_model_params(f"{self.model_name}_data/query_model_params.json")
 
         np.random.seed(seed)
         self.all_results = []
