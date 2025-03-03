@@ -1,13 +1,13 @@
 {
     "coefficients": [
-        -1.4767645485957221,
-        7.286389742388021,
-        0.8170882470260915,
-        -0.019774403494211175,
-        1.4515123984071112,
-        -2.2176660282029266
+        0.240132742696212,
+        0.09365209798934686,
+        0.010543310162678494,
+        -0.005263146068097268,
+        0.8642914901196493,
+        3.8996311376673463
     ],
-    "intercept": -242.77666141936805,
+    "intercept": 17.39762967912094,
     "features": [
         "w_gpu_percent",
         "w_cpu_percent",
@@ -16,6 +16,6 @@
         "batch_size",
         "log(batch_size)"
     ],
-    "mse": 2.7612955819589984,
-    "equation": "inference_latency = -1.4768 * w_gpu_percent + 7.2864 * w_cpu_percent + 0.8171 * cache_gpu_percent * batch_size + -0.0198 * cache_cpu_percent * batch_size + 1.4515 * batch_size + -2.2177 * log(batch_size) + -242.7767"
+    "mse": 10.628623473263794,
+    "equation": "inference_latency = 0.2401 * w_gpu_percent + 0.0937 * w_cpu_percent + 0.0105 * cache_gpu_percent * batch_size + -0.0053 * cache_cpu_percent * batch_size + 0.8643 * batch_size + 3.8996 * log(batch_size) + 17.3976"
 }
