@@ -41,7 +41,7 @@ class ActiveProfilingProcessor:
         self.questions = questions
         self.embedding_model = embedding_model
         self.model_name = model_name
-        self.model, self.model_config, self.env = init_dynagen_model(model_name, tokenizer, [20, 20, 20, 20])
+        self.model, self.model_config, self.env = init_dynagen_model(model_name, tokenizer, [0, 50, 0, 50])
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
@@ -473,7 +473,7 @@ class ActiveProfilingProcessor:
                     "max_latency": float(max_latency),
                 }
 
-                os.makedirs(f"{self.model_name}+_data", exist_ok=True)
+                os.makedirs(f"{self.model_name}_data", exist_ok=True)
 
                 # Save the optimal configuration for this batch size
                 config_file = f"{self.model_name}_data/optimal_config_batch{batch_size}.json"

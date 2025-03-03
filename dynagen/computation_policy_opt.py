@@ -158,7 +158,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     if i == 0:
                         prefetch_distance = 1  # How many steps ahead to prefetch
                     else:
-                        prefetch_distance = 1  # How many steps ahead to prefetch
+                        prefetch_distance = 4  # How many steps ahead to prefetch
 
                     # Prefetch weights for upcoming operations
                     for offset in range(1, prefetch_distance + 1):
@@ -199,7 +199,8 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     this.load_hidden(i, j, k + 1)
                     this.compute_layer(i, j, k)
                     this.store_cache(i, j, k - 1, overlap=False)
-                    # this.sync()
+                    if j == this.num_layers - 1:
+                        this.sync()
 
             # Check for early stopping condition
             if this.task.stop and np.all(this.stopped):

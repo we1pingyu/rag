@@ -13,6 +13,7 @@ from baseline import BaselineProcessor
 from active_profiling import ActiveProfilingProcessor
 from dyn_pipeline import DynPipelineProcessor
 from efficient_rag import VLLMProcessor
+from offline import OfflineProcessor
 from utils import build_index, get_milvus_memory_usage, calculate_latency_stats
 
 
@@ -60,11 +61,12 @@ if __name__ == "__main__":
     )
     mode_group.add_argument("--vllm", action="store_true", help="Run with VLLM for efficient generation")
     mode_group.add_argument("--active", action="store_true", help="Run in active profiling mode with dynagen model")
+    mode_group.add_argument("--offline", action="store_true", help="Run in offline mode with dynagen model")
     parser.add_argument(
         "--percent",
         nargs="+",
         type=int,
-        default=[0, 50, 0, 50],
+        default=[0, 40, 0, 20],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
@@ -211,8 +213,24 @@ if __name__ == "__main__":
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
             )
+        elif args.offline:
+            print("\nRunning in offline mode (batch processing)")
+            processor = OfflineProcessor(
+                questions=all_questions[: args.total_questions],
+                batch_size=args.batch_size,
+                embedding_model=embedding_model,
+                model_name=args.model,
+                tokenizer=tokenizer,
+                collection=collection,
+                partition_names=["partition_0"],
+                w_gpu_percent=args.percent[0],
+                w_cpu_percent=args.percent[1],
+                cache_gpu_percent=args.percent[2],
+                cache_cpu_percent=args.percent[3],
+                resident_partitions=args.resident_partitions,
+            )
 
-        if not args.active:
+        if not args.active and not args.offline:
             print(f"\nStarting processing:")
             print(f"Total questions: {len(all_questions[:args.total_questions])}")
             print(f"Batch size: {args.batch_size}")

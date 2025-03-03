@@ -1,2 +1,3 @@
 CUDA_VISIBLE_DEVICES=0 python main.py --display_results --active --model meta-llama/Llama-3.1-8B-Instruct --cpu_memory_limit 176 --gpu_memory_limit 12 
 # CUDA_VISIBLE_DEVICES=0 python main.py --display_results --active --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 256 --gpu_memory_limit 24 
+# CUDA_VISIBLE_DEVICES=0 python main.py --display_results --offline --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 176 --gpu_memory_limit 12 --total_questions 16 --batch_size 16 --percent 0 50 0 50

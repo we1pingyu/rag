@@ -1,7 +1,7 @@
 import time
 from typing import List, Dict
 from tqdm import tqdm
-from utils import batch_query, batch_generate_responses, split_batch, Question
+from utils import batch_query, batch_generate_responses, split_batch, Question, init_dynagen_model
 
 
 class OfflineProcessor:
@@ -11,7 +11,7 @@ class OfflineProcessor:
         questions: List[Dict],
         batch_size: int,
         embedding_model,
-        model,
+        model_name,
         tokenizer,
         collection,
         partition_names: List[str],
@@ -20,13 +20,13 @@ class OfflineProcessor:
         w_cpu_percent=0,
         cache_gpu_percent=0,
         cache_cpu_percent=0,
-        dynagen: bool = False,
-        env=None,
     ):
         self.questions = questions
         self.batch_size = batch_size
         self.embedding_model = embedding_model
-        self.model = model
+        self.model, self.model_config, self.env = init_dynagen_model(
+            model_name, tokenizer, [w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent]
+        )
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
@@ -35,8 +35,6 @@ class OfflineProcessor:
         self.w_cpu_percent = w_cpu_percent
         self.cache_gpu_percent = cache_gpu_percent
         self.cache_cpu_percent = cache_cpu_percent
-        self.dynagen = dynagen
-        self.env = env
         self.results = []
         self.base_time = time.time()
 
@@ -91,7 +89,7 @@ class OfflineProcessor:
             batch_results=batch_results,
             max_new_tokens=16,
             batch_size=len(batch),
-            dynagen=self.dynagen,
+            dynagen=True,
             env=self.env,
         )
         gen_time = time.time() - gen_start
