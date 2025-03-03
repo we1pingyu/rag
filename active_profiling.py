@@ -36,7 +36,7 @@ class ActiveProfilingProcessor:
         partition_names: List[str],
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
-        safety_margin: float = 0.7,
+        safety_margin: float = 0.8,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
@@ -45,8 +45,8 @@ class ActiveProfilingProcessor:
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
-        self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
         self.gpu_memory_gb = gpu_memory_gb * safety_margin
+        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb  # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
@@ -74,14 +74,14 @@ class ActiveProfilingProcessor:
 
     def estimate_attention_working_memory(self, batch_size: int) -> float:
         """Estimate attention mechanism working memory in GB for given batch size
-        
+
         This includes:
         - QKV projections
         - Attention matrices
         - Output projections
         """
         input_dim = self.model_config.input_dim  # h1 in cost_model
-        n_head = self.model_config.n_head        # nh in cost_model
+        n_head = self.model_config.n_head  # nh in cost_model
         head_dim = input_dim // n_head
         seq_len = 512 + 16  # Current fixed sequence length in the processor
 
@@ -93,9 +93,11 @@ class ActiveProfilingProcessor:
         # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 2 bytes
         # - Attention scores: batch_size * n_head * seq_len * seq_len * 2 bytes
         # - Attention output: batch_size * seq_len * input_dim * 2 bytes
-        attention_memory = (3 * batch_size * n_head * seq_len * head_dim * 2) + \
-                        (batch_size * n_head * seq_len * seq_len * 2) + \
-                        (batch_size * seq_len * input_dim * 2)
+        attention_memory = (
+            (3 * batch_size * n_head * seq_len * head_dim * 2)
+            + (batch_size * n_head * seq_len * seq_len * 2)
+            + (batch_size * seq_len * input_dim * 2)
+        )
 
         # Output projection: batch_size * seq_len * input_dim * 2 bytes
         output_memory = batch_size * seq_len * input_dim * 2
@@ -105,10 +107,10 @@ class ActiveProfilingProcessor:
 
     def estimate_mlp_working_memory(self, batch_size: int) -> float:
         """Estimate MLP layer working memory in GB for given batch size
-        
+
         This includes intermediate activations in feed-forward networks
         """
-        input_dim = self.model_config.input_dim           # h1 in cost_model
+        input_dim = self.model_config.input_dim  # h1 in cost_model
         intermediate_size = self.model_config.intermediate_size  # h2 in cost_model
         seq_len = 512 + 16  # Current fixed sequence length
 
@@ -137,10 +139,10 @@ class ActiveProfilingProcessor:
     # Enhanced gpu_memory_available method
     def gpu_memory_available(self, batch_size) -> float:
         """Calculate available GPU memory after accounting for model and computation memory needs
-        
+
         Returns the amount of available GPU memory in GB after allocating memory for:
         - Model weights on GPU
-        - KV Cache on GPU  
+        - KV Cache on GPU
         - Hidden states
         - Working memory for attention mechanism
         - Working memory for MLP layers
@@ -809,42 +811,6 @@ class ActiveProfilingProcessor:
                         best_max_time = max_time
                         best_config = result
                         cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
-                        # Try using the model if we have enough data now
-                        if len(training_data["batch_size"]) >= learning_samples:
-                            print("Enough data for training model, trying model prediction")
-                            # Update the cost models with the latest data
-                            inf_model, query_model = self.learning_cost_model(
-                                training_data["batch_size"],
-                                training_data["cache_gpu_percent"],
-                                training_data["cache_cpu_percent"],
-                                training_data["w_gpu_percent"],
-                                training_data["w_cpu_percent"],
-                                training_data["resident_partitions"],
-                                training_data["inference_latency"],
-                                training_data["query_latency"],
-                            )
-
-                            predicted_config = self.find_optimal_config_with_model(batch_size, inf_model, query_model)
-
-                            if predicted_config:
-                                # Check if we've already tried this configuration
-                                model_config_key = (
-                                    batch_size,
-                                    predicted_config["cache_gpu_percent"],
-                                    predicted_config["cache_cpu_percent"],
-                                    predicted_config["w_gpu_percent"],
-                                    predicted_config["w_cpu_percent"],
-                                    predicted_config["resident_partitions"],
-                                )
-
-                                if model_config_key not in configurations_tried:
-                                    # Try the model's prediction next
-                                    distribution["cache_gpu_percent"] = predicted_config["cache_gpu_percent"]
-                                    distribution["cache_cpu_percent"] = predicted_config["cache_cpu_percent"]
-                                    distribution["w_gpu_percent"] = predicted_config["w_gpu_percent"]
-                                    distribution["w_cpu_percent"] = predicted_config["w_cpu_percent"]
-                                    distribution["resident_partitions"] = predicted_config["resident_partitions"]
-                                    continue
 
                         # Check if times are balanced
                         if time_diff_percent <= 10:

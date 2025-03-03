@@ -1,0 +1,21 @@
+{
+    "coefficients": [
+        -42.014455634073144,
+        -9.615579196385232,
+        -7.105427357601002e-15,
+        0.039744628597251294,
+        0.00039744628597416354,
+        -29.122063721130278
+    ],
+    "intercept": 1463.0542454515528,
+    "features": [
+        "w_gpu_percent",
+        "w_cpu_percent",
+        "cache_gpu_percent * batch_size",
+        "cache_cpu_percent * batch_size",
+        "batch_size",
+        "log(batch_size)"
+    ],
+    "mse": 1.0748771187245894,
+    "equation": "inference_latency = -42.0145 * w_gpu_percent + -9.6156 * w_cpu_percent + -0.0000 * cache_gpu_percent * batch_size + 0.0397 * cache_cpu_percent * batch_size + 0.0004 * batch_size + -29.1221 * log(batch_size) + 1463.0542"
+}

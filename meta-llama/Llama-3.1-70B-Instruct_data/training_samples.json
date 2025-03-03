@@ -1,0 +1,72 @@
+[
+    {
+        "batch_size": 2,
+        "cache_gpu_percent": 0,
+        "cache_cpu_percent": 100,
+        "w_gpu_percent": 9,
+        "w_cpu_percent": 91,
+        "resident_partitions": 5,
+        "inference_latency": 196.511146068573,
+        "query_latency": 240.182297706604,
+        "inference_predicted": 197.67028212547189,
+        "query_predicted": 242.4657029433128,
+        "inference_error": 1.1591360568988875,
+        "query_error": 2.283405236708802
+    },
+    {
+        "batch_size": 2,
+        "cache_gpu_percent": 0,
+        "cache_cpu_percent": 100,
+        "w_gpu_percent": 9,
+        "w_cpu_percent": 84,
+        "resident_partitions": 6,
+        "inference_latency": 266.13847255706787,
+        "query_latency": 251.2693932056427,
+        "inference_predicted": 264.97933650016853,
+        "query_predicted": 245.14624381676697,
+        "inference_error": -1.1591360568993423,
+        "query_error": -6.123149388875731
+    },
+    {
+        "batch_size": 4,
+        "cache_gpu_percent": 0,
+        "cache_cpu_percent": 100,
+        "w_gpu_percent": 9,
+        "w_cpu_percent": 91,
+        "resident_partitions": 5,
+        "inference_latency": 186.59326243400574,
+        "query_latency": 252.49260663986206,
+        "inference_predicted": 185.4341263771057,
+        "query_predicted": 254.04894555532016,
+        "inference_error": -1.1591360569000244,
+        "query_error": 1.5563389154580989
+    },
+    {
+        "batch_size": 4,
+        "cache_gpu_percent": 0,
+        "cache_cpu_percent": 100,
+        "w_gpu_percent": 9,
+        "w_cpu_percent": 84,
+        "resident_partitions": 6,
+        "inference_latency": 251.5840446949005,
+        "query_latency": 252.52620911598206,
+        "inference_predicted": 252.74318075180236,
+        "query_predicted": 256.7294864287743,
+        "inference_error": 1.1591360569018434,
+        "query_error": 4.203277312792238
+    },
+    {
+        "batch_size": 8,
+        "cache_gpu_percent": 0,
+        "cache_cpu_percent": 100,
+        "w_gpu_percent": 8,
+        "w_cpu_percent": 92,
+        "resident_partitions": 4,
+        "inference_latency": 213.54656767845154,
+        "query_latency": 276.4547619819641,
+        "inference_predicted": 213.54656767844972,
+        "query_predicted": 274.5348899058807,
+        "inference_error": -1.8189894035458565e-12,
+        "query_error": -1.9198720760834362
+    }
+]

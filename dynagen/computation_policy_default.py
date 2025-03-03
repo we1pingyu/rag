@@ -134,7 +134,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
         this.sync()
 
         # Generate
-        for i in tqdm(range(this.execute_gen_len)):
+        for i in tqdm(range(this.execute_gen_len), desc="Generating"):
             timers("generate").start()
             this.update_attention_mask(i, 0)
             for j in range(this.num_layers):
@@ -147,7 +147,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
                     break
                 this.store_cache(i, j - 1, 0, overlap=False)
                 this.store_hidden(i, j, 0)
-                # this.sync()
+                this.sync()
             timers("generate").stop()
 
             if this.task.stop and np.all(this.stopped):
@@ -161,7 +161,7 @@ class ComputationPolicyImpl(ComputationPolicyInterface):
         this.sync()
         # Generate
 
-        for i in tqdm(range(this.execute_gen_len)):
+        for i in tqdm(range(this.execute_gen_len), desc="Generating"):
             timers("generate").start()
             for k in range(this.num_gpu_batches):
                 this.update_attention_mask(i, k)
