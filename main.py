@@ -64,7 +64,7 @@ if __name__ == "__main__":
         "--percent",
         nargs="+",
         type=int,
-        default=[20, 20, 20, 20],
+        default=[0, 50, 0, 50],
         help="four numbers: w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent",
     )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
