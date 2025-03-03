@@ -16,3 +16,4 @@ model_data*/*py
 dynagen_offload_dir/
 *_data_*/
 *copy*
+meta-llama/

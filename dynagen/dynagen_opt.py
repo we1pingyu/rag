@@ -128,7 +128,7 @@ def init_weight_list(weight_specs, policy, env):
             compress = policy.compress_weight
 
         if not compress:
-            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
+            weight = home.allocate(shape, dtype, pin_memory=pin_memory, name=filename.split("/")[-1])
 
             if DUMMY_WEIGHT not in filename:
                 weight.load_from_np_file(weight_specs[i][2])

@@ -723,7 +723,12 @@ class TorchDisk:
         self.links[dst] = link
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
-        name = name or TorchTensor.next_name()
+        if name and name.startswith("cache"):
+            name = name + TorchTensor.next_name()
+        elif name and ("weight" in name or "layers" in name):
+            name = name
+        else:
+            name = TorchTensor.next_name()
         path = os.path.join(self.path, name)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype], path, self, name=name)
@@ -741,8 +746,8 @@ class TorchDisk:
             policy.gpu_batch_size,
         )
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        k_cache = self.allocate(shape, np.float16, "cache_")
+        v_cache = self.allocate(shape, np.float16, "cache_")
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -760,11 +765,26 @@ class TorchDisk:
         self.copy_queue = None
 
     def clear_copy_threads(self):
-        for _ in range(len(self.copy_threads)):
-            self.copy_queue.put_nowait(None)
-        # for t in self.copy_threads:
-        #     t.join()
-        # self.copy_queue.join()
+        """Clear and recreate copy threads if they're stuck"""
+        print("Clearing copy threads...")
+        try:
+            # Try to close existing threads gracefully
+            if self.copy_queue:
+                # Empty the queue first
+                while not self.copy_queue.empty():
+                    try:
+                        self.copy_queue.get_nowait()
+                        self.copy_queue.task_done()
+                    except:
+                        pass
+
+                # Then terminate the threads
+                for _ in range(len(self.copy_threads)):
+                    self.copy_queue.put_nowait(None)
+        except:
+            pass
+
+        # Create a new queue and threads
         self.copy_queue = queue.Queue()
         self.copy_threads = [
             threading.Thread(target=copy_worker_func, args=(self.copy_queue, self.cuda_id))
@@ -772,6 +792,8 @@ class TorchDisk:
         ]
         for t in self.copy_threads:
             t.start()
+
+        print("Copy threads reset successfully")
 
     def mem_stats(self):
         raise NotImplementedError()

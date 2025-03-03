@@ -11,6 +11,7 @@ import os
 import shutil
 import random
 import json
+import glob
 import math
 from scipy.optimize import linprog
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -45,8 +46,8 @@ class ActiveProfilingProcessor:
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
-        self.gpu_memory_gb = gpu_memory_gb * safety_margin
-        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb  # Leave some swap space
+        self.gpu_memory_gb = gpu_memory_gb
+        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb   # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
@@ -257,7 +258,18 @@ class ActiveProfilingProcessor:
                     env=self.env,
                 )
                 gen_time = time.time() - gen_start
+                cache_files = glob.glob('./dynagen_offload_dir/cache*')
 
+                # 遍历并删除文件
+                for file_path in cache_files:
+                    try:
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                            print(f"已删除: {file_path}")
+                    except Exception as e:
+                        print(f"删除文件 {file_path} 时出错: {e}")
+
+                print(f"总共删除了 {len(cache_files)} 个文件")
                 if generation_result[1] == "timeout":
                     print(f"Generation timeout detected (>{timeout:.2f}s)")
                     return {"error": "cpu_oom"}
@@ -376,7 +388,7 @@ class ActiveProfilingProcessor:
             distribution["cache_cpu_percent"] = 0
 
         # Finally, use remaining CPU memory for resident partitions
-        distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
+        distribution["resident_partitions"] = min(9, max(0, int(available_cpu_memory / self.partition_size_gb)))
         return distribution
 
     def find_optimal_config_with_model(
@@ -508,7 +520,7 @@ class ActiveProfilingProcessor:
             (0, 100),  # w_cpu_percent
             (0, 100),  # cache_gpu_percent
             (0, 100),  # cache_cpu_percent
-            (0, min(10, len(self.partition_names))),  # resident_partitions
+            (0, min(9, len(self.partition_names))),  # resident_partitions
             (0, None),  # max_latency (no upper bound)
         ]
 
@@ -641,7 +653,7 @@ class ActiveProfilingProcessor:
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192]
+        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -850,11 +862,11 @@ class ActiveProfilingProcessor:
                             if distribution["cache_cpu_percent"] * cache_size / 100 > self.partition_size_gb:
                                 reduction = int(self.partition_size_gb / cache_size * 100)
                                 distribution["cache_cpu_percent"] -= reduction
-                                distribution["resident_partitions"] += 1
+                                distribution["resident_partitions"] = min(9, distribution["resident_partitions"] + 1)
                             elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > self.partition_size_gb:
                                 reduction = int(self.partition_size_gb / self.total_weight_gb * 100)
                                 distribution["w_cpu_percent"] -= reduction
-                                distribution["resident_partitions"] += 1
+                                distribution["resident_partitions"] = min(9, distribution["resident_partitions"] + 1)
                     else:
                         break
                 else:
@@ -1136,4 +1148,5 @@ class ActiveProfilingProcessor:
             print(f"  - CPU: {config['memory_usage']['cpu_used']:.2f} GB")
             print(f"  - GPU: {config['memory_usage']['gpu_used']:.2f} GB")
 
+        self.env.close_copy_threads()
         return optimal_configs
