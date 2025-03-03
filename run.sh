@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=0 python main.py --display_results --active --model meta-llama/Llama-3.1-8B-Instruct --cpu_memory_limit 176 --gpu_memory_limit 12 
+# CUDA_VISIBLE_DEVICES=0 python main.py --display_results --active --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 256 --gpu_memory_limit 24 

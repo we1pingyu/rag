@@ -473,11 +473,11 @@ class ActiveProfilingProcessor:
                     "max_latency": float(max_latency),
                 }
 
-                os.makedirs(f"{self.model_name}", exist_ok=True)
+                os.makedirs(f"{self.model_name+"_data"}", exist_ok=True)
 
                 # Save the optimal configuration for this batch size
-                config_file = f"{self.model_name}/optimal_config_batch{batch_size}.json"
-                all_configs_file = f"{self.model_name}/all_optimal_configs.json"
+                config_file = f"{self.model_name+"_data"}/optimal_config_batch{batch_size}.json"
+                all_configs_file = f"{self.model_name+"_data"}/all_optimal_configs.json"
 
                 with open(config_file, "w") as f:
                     json.dump(best_config, f, indent=4)
@@ -975,7 +975,7 @@ class ActiveProfilingProcessor:
         print(f"查询模型MSE: {query_mse:.4f}")
 
         # 保存模型参数和数据到人类可读的文件
-        os.makedirs(f"{self.model_name}", exist_ok=True)
+        os.makedirs(f"{self.model_name+"_data"}", exist_ok=True)
 
         # 保存推理模型参数
         inf_model_params = {
@@ -1000,7 +1000,7 @@ class ActiveProfilingProcessor:
             + f"{inf_model.intercept_:.4f}",
         }
 
-        with open(f"{self.model_name}/inference_model_params.json", "w") as f:
+        with open(f"{self.model_name+"_data"}/inference_model_params.json", "w") as f:
             json.dump(inf_model_params, f, indent=4)
 
         # 保存查询模型参数
@@ -1015,7 +1015,7 @@ class ActiveProfilingProcessor:
             + f"{query_model.intercept_:.4f}",
         }
 
-        with open(f"{self.model_name}/query_model_params.json", "w") as f:
+        with open(f"{self.model_name+"_data"}/query_model_params.json", "w") as f:
             json.dump(query_model_params, f, indent=4)
 
         # 保存训练数据
@@ -1036,7 +1036,7 @@ class ActiveProfilingProcessor:
                 float(x) if isinstance(x, (np.integer, np.floating)) else x for x in training_data[key]
             ]
 
-        with open(f"{self.model_name}/training_data.json", "w") as f:
+        with open(f"{self.model_name+"_data"}/training_data.json", "w") as f:
             json.dump(training_data, f, indent=4)
 
         # 保存完整的训练样本供可视化和分析
@@ -1059,7 +1059,7 @@ class ActiveProfilingProcessor:
                 }
             )
 
-        with open(f"{self.model_name}/training_samples.json", "w") as f:
+        with open(f"{self.model_name+"_data"}/training_samples.json", "w") as f:
             json.dump(samples, f, indent=4)
 
         return inf_model, query_model
