@@ -72,12 +72,93 @@ class ActiveProfilingProcessor:
         """Estimate cache size in GB for given batch size"""
         return self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
 
-    def gpu_memory_available(self, batch_size) -> bool:
-        return self.gpu_memory_gb - 1.1 * (
-            2 * self.estimate_cache_size(batch_size)
-            + 2 * self.compute_weight_gb
-            + self.estimate_hidden_size(batch_size)
-        )
+    def estimate_attention_working_memory(self, batch_size: int) -> float:
+        """Estimate attention mechanism working memory in GB for given batch size
+        
+        This includes:
+        - QKV projections
+        - Attention matrices
+        - Output projections
+        """
+        input_dim = self.model_config.input_dim  # h1 in cost_model
+        n_head = self.model_config.n_head        # nh in cost_model
+        head_dim = input_dim // n_head
+        seq_len = 512 + 16  # Current fixed sequence length in the processor
+
+        # Memory in bytes (following cost_model calculations)
+        # QKV projections: 3 projections each of size batch_size * seq_len * input_dim * 2 bytes (assuming float16)
+        qkv_memory = 3 * batch_size * seq_len * input_dim * 2
+
+        # Attention calculation:
+        # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 2 bytes
+        # - Attention scores: batch_size * n_head * seq_len * seq_len * 2 bytes
+        # - Attention output: batch_size * seq_len * input_dim * 2 bytes
+        attention_memory = (3 * batch_size * n_head * seq_len * head_dim * 2) + \
+                        (batch_size * n_head * seq_len * seq_len * 2) + \
+                        (batch_size * seq_len * input_dim * 2)
+
+        # Output projection: batch_size * seq_len * input_dim * 2 bytes
+        output_memory = batch_size * seq_len * input_dim * 2
+
+        total_memory_bytes = qkv_memory + attention_memory + output_memory
+        return total_memory_bytes / (1024**3)  # Convert to GB
+
+    def estimate_mlp_working_memory(self, batch_size: int) -> float:
+        """Estimate MLP layer working memory in GB for given batch size
+        
+        This includes intermediate activations in feed-forward networks
+        """
+        input_dim = self.model_config.input_dim           # h1 in cost_model
+        intermediate_size = self.model_config.intermediate_size  # h2 in cost_model
+        seq_len = 512 + 16  # Current fixed sequence length
+
+        # Following cost_model calculations:
+        # - First projection (input_dim to intermediate_size): batch_size * seq_len * intermediate_size * 2 bytes
+        mlp1_memory = batch_size * seq_len * intermediate_size * 2
+
+        # - Second projection (intermediate_size to input_dim): batch_size * seq_len * input_dim * 2 bytes
+        mlp2_memory = batch_size * seq_len * input_dim * 2
+
+        # - Intermediate activations: batch_size * seq_len * intermediate_size * 2 bytes
+        activation_memory = batch_size * seq_len * intermediate_size * 2
+
+        total_memory_bytes = mlp1_memory + mlp2_memory + activation_memory
+        return total_memory_bytes / (1024**3)  # Convert to GB
+
+    def estimate_total_working_memory(self, batch_size: int) -> float:
+        """Estimate total working memory needed for computation, including attention and MLP states"""
+        attention_memory = self.estimate_attention_working_memory(batch_size)
+        mlp_memory = self.estimate_mlp_working_memory(batch_size)
+
+        # Add some overhead for other operations
+        overhead_factor = 1.1
+        return (attention_memory + mlp_memory) * overhead_factor
+
+    # Enhanced gpu_memory_available method
+    def gpu_memory_available(self, batch_size) -> float:
+        """Calculate available GPU memory after accounting for model and computation memory needs
+        
+        Returns the amount of available GPU memory in GB after allocating memory for:
+        - Model weights on GPU
+        - KV Cache on GPU  
+        - Hidden states
+        - Working memory for attention mechanism
+        - Working memory for MLP layers
+        """
+        batch_size_split, _ = split_batch(batch_size)
+        # Original computations
+        weights_memory = self.compute_weight_gb * 2  # Compute weight allocation
+        cache_memory = 2 * self.estimate_cache_size(batch_size_split)  # KV cache
+        hidden_memory = self.estimate_hidden_size(batch_size)  # Hidden states
+
+        # New working memory computations
+        working_memory = self.estimate_total_working_memory(batch_size_split)
+
+        # Total GPU memory needed with proper safety margins
+        total_needed = weights_memory + cache_memory + hidden_memory + working_memory
+
+        # Return available GPU memory after allocating for computation
+        return self.gpu_memory_gb - 1.1 * total_needed
 
     def update_resident_partitions(self, new_resident_partitions: int):
         """Update number of resident partitions"""
