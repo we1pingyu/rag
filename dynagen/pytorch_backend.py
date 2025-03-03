@@ -95,7 +95,12 @@ class TorchTensor:
         # Whether delete the file when the tensor is deleted
         self.delete_file = True
 
-        self.name = name or TorchTensor.next_name()
+        if name and name.startswith("cache"):
+            self.name = name + TorchTensor.next_name()
+        elif name and ("weight" in name or "layers" in name):
+            self.name = name
+        else:
+            self.name = TorchTensor.next_name()
 
     @property
     def bytes(self):
@@ -133,7 +138,7 @@ class TorchTensor:
         else:
             self.load_from_np(np.load(filename))
 
-    def copy(self, dst, src_indices=None):
+    def copy(self, dst, src_indices=None, name=None):
         if src_indices:
             assert all(x.step is None for x in src_indices)
             shape = tuple(x.stop - x.start for x in src_indices) + self.shape[len(src_indices) :]
@@ -143,14 +148,14 @@ class TorchTensor:
         if dst.device_type == DeviceType.COMPRESSED:
             ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
         else:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
+            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], name=name)
         general_copy(ret, None, self, src_indices)
         return ret
 
-    def smart_copy(self, dst, src_indices=None):
+    def smart_copy(self, dst, src_indices=None, name=None):
         if self.device == dst:
             return self, False
-        return self.copy(dst, src_indices=src_indices), True
+        return self.copy(dst, src_indices=src_indices, name=name), True
 
     def move(self, dst):
         if self.device == dst:
@@ -311,8 +316,8 @@ class TorchDevice:
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory, name="cache_")
+        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory, name="cache_")
         return k_cache, v_cache
 
     def mha(
@@ -746,8 +751,8 @@ class TorchDisk:
             policy.gpu_batch_size,
         )
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, np.float16, "cache_")
-        v_cache = self.allocate(shape, np.float16, "cache_")
+        k_cache = self.allocate(shape, np.float16, name="cache_")
+        v_cache = self.allocate(shape, np.float16, name="cache_")
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -885,8 +890,8 @@ class TorchMixedDevice(TorchMixedDeviceMemManager):
         lens = [len_gpu, len_cpu, len_disk]
 
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
+        k_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory, name="cache_")
+        v_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory, name="cache_")
         return k_cache, v_cache
 
 

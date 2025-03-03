@@ -208,7 +208,7 @@ if __name__ == "__main__":
                 model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
-                partition_names=partition_names,
+                partition_names=["partition_0"],
                 partition_size_gb=partition_size_gb,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,

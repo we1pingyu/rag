@@ -57,11 +57,12 @@ def update_weight_list(weight_specs, policy, env):
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
     devices = []
+    filenames = []
 
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-        shape = weight_specs[i][0]
+        shape, dtype, filename = weight_specs[i]
         if len(shape) < 2:
             compress = False
         else:
@@ -72,8 +73,9 @@ def update_weight_list(weight_specs, policy, env):
             devices.append(home)
         else:
             devices.append(home.compressed_device)
+        filenames.append(filename)
 
-    return devices
+    return devices, filenames
 
 
 class LlamaInputEmbed(InputEmbed):
@@ -100,11 +102,11 @@ class LlamaInputEmbed(InputEmbed):
             # w_token
             ((v, h), dtype, path + "embed_tokens.weight"),
         ]
-        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        new_devices, filenames = update_weight_list(weight_specs, self.policy, self.env)
         old_weights = weight_home.val
 
-        for old_w, new_d in zip(old_weights, new_devices):
-            old_w.smart_copy(new_d)
+        for old_w, new_d, filename in zip(old_weights, new_devices, filenames):
+            old_w.smart_copy(new_d, name=filename.split("/")[-1])
 
         weight_home.val = old_weights
 
@@ -159,11 +161,11 @@ class LlamaOutputEmbed(OutputEmbed):
             # w_token
             ((v, h), dtype, path + "lm_head.weight"),
         ]
-        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        new_devices, filenames = update_weight_list(weight_specs, self.policy, self.env)
         old_weights = weight_home.val
 
-        for old_w, new_d in zip(old_weights, new_devices):
-            old_w.smart_copy(new_d)
+        for old_w, new_d, filename in zip(old_weights, new_devices, filenames):
+            old_w.smart_copy(new_d, name=filename.split("/")[-1])
 
         weight_home.val = old_weights
 
@@ -254,11 +256,11 @@ class LlamaSelfAttention(SelfAttention):
             # w_o
             ((n_head * head_dim, h), dtype, path + "self_attn.o_proj.weight"),
         ]
-        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        new_devices, filenames = update_weight_list(weight_specs, self.policy, self.env)
         old_weights = weight_home.val
 
-        for old_w, new_d in zip(old_weights, new_devices):
-            old_w.smart_copy(new_d)
+        for old_w, new_d, filename in zip(old_weights, new_devices, filenames):
+            old_w.smart_copy(new_d, name=filename.split("/")[-1])
 
         weight_home.val = old_weights
 
@@ -390,11 +392,11 @@ class LlamaMLP(MLP):
             # w_d
             ((h, intermediate), dtype, path + "mlp.down_proj.weight"),
         ]
-        new_devices = update_weight_list(weight_specs, self.policy, self.env)
+        new_devices, filenames = update_weight_list(weight_specs, self.policy, self.env)
         old_weights = weight_home.val
 
-        for old_w, new_d in zip(old_weights, new_devices):
-            old_w.smart_copy(new_d)
+        for old_w, new_d, filename in zip(old_weights, new_devices, filenames):
+            old_w.smart_copy(new_d, name=filename.split("/")[-1])
 
         weight_home.val = old_weights
 

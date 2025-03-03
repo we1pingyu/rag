@@ -47,7 +47,7 @@ class ActiveProfilingProcessor:
         self.collection = collection
         self.partition_names = partition_names
         self.gpu_memory_gb = gpu_memory_gb
-        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb   # Leave some swap space
+        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb  # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
@@ -258,18 +258,14 @@ class ActiveProfilingProcessor:
                     env=self.env,
                 )
                 gen_time = time.time() - gen_start
-                cache_files = glob.glob('./dynagen_offload_dir/cache*')
-
-                # 遍历并删除文件
+                cache_files = glob.glob("./dynagen_offload_dir/t_*")
                 for file_path in cache_files:
                     try:
                         if os.path.isfile(file_path):
                             os.remove(file_path)
-                            print(f"已删除: {file_path}")
                     except Exception as e:
-                        print(f"删除文件 {file_path} 时出错: {e}")
-
-                print(f"总共删除了 {len(cache_files)} 个文件")
+                        continue
+                print(f"delete {len(cache_files)} files on disk")
                 if generation_result[1] == "timeout":
                     print(f"Generation timeout detected (>{timeout:.2f}s)")
                     return {"error": "cpu_oom"}
