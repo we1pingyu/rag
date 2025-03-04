@@ -158,7 +158,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     if i == 0:
                         prefetch_distance = 1  # How many steps ahead to prefetch
                     else:
-                        prefetch_distance = 4  # How many steps ahead to prefetch
+                        prefetch_distance = 2  # How many steps ahead to prefetch
 
                     # Prefetch weights for upcoming operations
                     for offset in range(1, prefetch_distance + 1):

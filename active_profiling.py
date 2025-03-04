@@ -37,7 +37,6 @@ class ActiveProfilingProcessor:
         partition_names: List[str],
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
-        safety_margin: float = 0.9,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
@@ -46,8 +45,8 @@ class ActiveProfilingProcessor:
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
-        self.gpu_memory_gb = gpu_memory_gb
-        self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
+        self.gpu_memory_gb = gpu_memory_gb * 0.9
+        self.total_cpu_gb = total_cpu_gb * 0.7  
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
@@ -87,21 +86,21 @@ class ActiveProfilingProcessor:
         seq_len = 512 + 16  # Current fixed sequence length in the processor
 
         # Memory in bytes (following cost_model calculations)
-        # QKV projections: 3 projections each of size batch_size * seq_len * input_dim * 2 bytes (assuming float16)
-        qkv_memory = 3 * batch_size * seq_len * input_dim * 2
+        # QKV projections: 3 projections each of size batch_size * seq_len * input_dim * 4 bytes (assuming float32)
+        qkv_memory = 3 * batch_size * seq_len * input_dim * 4
 
         # Attention calculation:
-        # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 2 bytes
-        # - Attention scores: batch_size * n_head * seq_len * seq_len * 2 bytes
-        # - Attention output: batch_size * seq_len * input_dim * 2 bytes
+        # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 4 bytes
+        # - Attention scores: batch_size * n_head * seq_len * seq_len * 4 bytes
+        # - Attention output: batch_size * seq_len * input_dim * 4 bytes
         attention_memory = (
-            (3 * batch_size * n_head * seq_len * head_dim * 2)
-            + (batch_size * n_head * seq_len * seq_len * 2)
-            + (batch_size * seq_len * input_dim * 2)
+            (3 * batch_size * n_head * seq_len * head_dim * 4)
+            + (batch_size * n_head * seq_len * seq_len * 4)
+            + (batch_size * seq_len * input_dim * 4)
         )
 
-        # Output projection: batch_size * seq_len * input_dim * 2 bytes
-        output_memory = batch_size * seq_len * input_dim * 2
+        # Output projection: batch_size * seq_len * input_dim * 4 bytes
+        output_memory = batch_size * seq_len * input_dim * 4
 
         total_memory_bytes = qkv_memory + attention_memory + output_memory
         return total_memory_bytes / (1024**3)  # Convert to GB
@@ -116,14 +115,14 @@ class ActiveProfilingProcessor:
         seq_len = 512 + 16  # Current fixed sequence length
 
         # Following cost_model calculations:
-        # - First projection (input_dim to intermediate_size): batch_size * seq_len * intermediate_size * 2 bytes
-        mlp1_memory = batch_size * seq_len * intermediate_size * 2
+        # - First projection (input_dim to intermediate_size): batch_size * seq_len * intermediate_size * 4 bytes
+        mlp1_memory = batch_size * seq_len * intermediate_size * 4
 
-        # - Second projection (intermediate_size to input_dim): batch_size * seq_len * input_dim * 2 bytes
-        mlp2_memory = batch_size * seq_len * input_dim * 2
+        # - Second projection (intermediate_size to input_dim): batch_size * seq_len * input_dim * 4 bytes
+        mlp2_memory = batch_size * seq_len * input_dim * 4
 
-        # - Intermediate activations: batch_size * seq_len * intermediate_size * 2 bytes
-        activation_memory = batch_size * seq_len * intermediate_size * 2
+        # - Intermediate activations: batch_size * seq_len * intermediate_size * 4 bytes
+        activation_memory = batch_size * seq_len * intermediate_size * 4
 
         total_memory_bytes = mlp1_memory + mlp2_memory + activation_memory
         return total_memory_bytes / (1024**3)  # Convert to GB
@@ -195,139 +194,88 @@ class ActiveProfilingProcessor:
         num_test_batches: int = 1,
     ) -> Optional[Dict]:
         """Try a specific configuration"""
-        thread_exceptions = []
 
-        def exception_handler(args):
-            if isinstance(args.exc_value, (OSError, RuntimeError)) and (
-                "Cannot allocate memory" in str(args.exc_value) or "[Errno 12]" in str(args.exc_value)
-            ):
-                thread_exceptions.append(args)
+        batch_size_split, num_batch = split_batch(batch_size)
+        print(f"Available GPU memory: {self.gpu_memory_available(batch_size):.2f} GB")
+        print("Splitting batch into batches:", batch_size_split, ", num_batch: ", num_batch)
+        self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
+        self.model.update_weight(w_gpu_percent, w_cpu_percent)
+        actual_resident_partitions = self.update_resident_partitions(resident_partitions)
 
-        threading.excepthook = exception_handler
+        timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
 
-        try:
-            # if os.path.exists("./dynagen_offload_dir"):
-            #     shutil.rmtree("./dynagen_offload_dir")
-            #     os.makedirs("./dynagen_offload_dir")
-            batch_size_split, num_batch = split_batch(batch_size)
-            print(f"Available GPU memory: {self.gpu_memory_available(batch_size):.2f} GB")
-            print("Splitting batch into batches:", batch_size_split, ", num_batch: ", num_batch)
-            self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
-            self.model.update_weight(w_gpu_percent, w_cpu_percent)
-            actual_resident_partitions = self.update_resident_partitions(resident_partitions)
+        for i in range(num_test_batches):
 
-            timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
+            start_idx = i * batch_size
+            if start_idx >= len(self.questions):
+                break
 
-            for i in range(num_test_batches):
-                if thread_exceptions:
-                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
-                    return {"error": "cpu_oom"}
+            batch = self.questions[start_idx : start_idx + batch_size]
+            query_texts = [q["question"] for q in batch]
+            query_embeddings = self.embedding_model.embed_documents(query_texts)
 
-                start_idx = i * batch_size
-                if start_idx >= len(self.questions):
-                    break
+            query_start = time.time()
+            batch_results, _ = batch_query(
+                collection=self.collection,
+                questions=batch,
+                query_texts=query_texts,
+                query_embeddings=query_embeddings,
+                partition_names=self.partition_names,
+                resident_partitions=actual_resident_partitions,
+            )
+            query_time = time.time() - query_start
 
-                batch = self.questions[start_idx : start_idx + batch_size]
-                query_texts = [q["question"] for q in batch]
-                query_embeddings = self.embedding_model.embed_documents(query_texts)
+            # Set timeout to 2x the previous generation time
+            timeout = self.prev_gen_time * 2  # Min 10s, max 300s
+            gen_start = time.time()
+            generation_result = batch_generate_responses(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                batch_results=batch_results,
+                max_new_tokens=16,
+                batch_size=batch_size,
+                env=self.env,
+            )
+            gen_time = time.time() - gen_start
+            cache_files = glob.glob("./dynagen_offload_dir/t_*")
+            for file_path in cache_files:
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    continue
+            print(f"delete {len(cache_files)} files on disk")
 
-                query_start = time.time()
-                batch_results, _ = batch_query(
-                    collection=self.collection,
-                    questions=batch,
-                    query_texts=query_texts,
-                    query_embeddings=query_embeddings,
-                    partition_names=self.partition_names,
-                    resident_partitions=actual_resident_partitions,
-                )
-                query_time = time.time() - query_start
+            responses, _ = generation_result
 
-                if thread_exceptions:
-                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
-                    return {"error": "cpu_oom"}
+            # Update previous generation time for next batch
+            self.prev_gen_time = gen_time
 
-                # Set timeout to 2x the previous generation time
-                timeout = self.prev_gen_time * 2  # Min 10s, max 300s
-                gen_start = time.time()
-                generation_result = batch_generate_responses(
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    batch_results=batch_results,
-                    max_new_tokens=16,
-                    batch_size=batch_size,
-                    env=self.env,
-                )
-                gen_time = time.time() - gen_start
-                cache_files = glob.glob("./dynagen_offload_dir/t_*")
-                for file_path in cache_files:
-                    try:
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
-                    except Exception as e:
-                        continue
-                print(f"delete {len(cache_files)} files on disk")
-                if generation_result[1] == "timeout":
-                    print(f"Generation timeout detected (>{timeout:.2f}s)")
-                    return {"error": "cpu_oom"}
-                elif "out of memory" in generation_result[1]:
-                    return {"error": "gpu_oom"}
+            timing_stats["query_times"].append(query_time)
+            timing_stats["generation_times"].append(gen_time)
+            timing_stats["total_times"].append(query_time + gen_time)
 
-                responses, _ = generation_result
+        avg_query_time = np.mean(timing_stats["query_times"])
+        avg_gen_time = np.mean(timing_stats["generation_times"])
+        avg_total_time = np.mean(timing_stats["total_times"])
 
-                # Update previous generation time for next batch
-                self.prev_gen_time = gen_time
+        memory_usage = self.get_memory_usage()
 
-                timing_stats["query_times"].append(query_time)
-                timing_stats["generation_times"].append(gen_time)
-                timing_stats["total_times"].append(query_time + gen_time)
+        return {
+            "batch_size": batch_size,
+            "cache_gpu_percent": cache_gpu_percent,
+            "cache_cpu_percent": cache_cpu_percent,
+            "w_gpu_percent": w_gpu_percent,
+            "w_cpu_percent": w_cpu_percent,
+            "resident_partitions": actual_resident_partitions,
+            "avg_query_time": avg_query_time,
+            "avg_gen_time": avg_gen_time,
+            "avg_total_time": avg_total_time,
+            "memory_usage": memory_usage,
+            "success": True,
+        }
 
-            if thread_exceptions:
-                print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
-                return {"error": "cpu_oom"}
-
-            avg_query_time = np.mean(timing_stats["query_times"])
-            avg_gen_time = np.mean(timing_stats["generation_times"])
-            avg_total_time = np.mean(timing_stats["total_times"])
-
-            memory_usage = self.get_memory_usage()
-
-            return {
-                "batch_size": batch_size,
-                "cache_gpu_percent": cache_gpu_percent,
-                "cache_cpu_percent": cache_cpu_percent,
-                "w_gpu_percent": w_gpu_percent,
-                "w_cpu_percent": w_cpu_percent,
-                "resident_partitions": actual_resident_partitions,
-                "avg_query_time": avg_query_time,
-                "avg_gen_time": avg_gen_time,
-                "avg_total_time": avg_total_time,
-                "memory_usage": memory_usage,
-                "success": True,
-            }
-
-        except (RuntimeError, torch.cuda.OutOfMemoryError, OSError, Exception) as e:
-            error_msg = str(e)
-
-            if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in error_msg:
-                print(f"GPU OOM detected: {error_msg}")
-                return {"error": "gpu_oom"}
-            elif (
-                "Cannot allocate memory" in error_msg
-                or "[Errno 12]" in error_msg
-                or "Resource temporarily unavailable" in error_msg
-                or "libgomp" in error_msg
-            ):
-                print(f"CPU OOM detected: {error_msg}")
-                return {"error": "cpu_oom"}
-            elif "Exception in thread" in error_msg and "Cannot allocate memory" in error_msg:
-                print(f"Thread-related CPU OOM detected: {error_msg}")
-                return {"error": "cpu_oom"}
-            else:
-                print(f"Other error detected: {error_msg}")
-                return {"error": "other", "message": error_msg}
-
-        finally:
-            threading.excepthook = sys.__excepthook__
+       
 
     def calculate_memory_distribution(
         self, batch_size: int, available_gpu_memory: float, available_cpu_memory: float
@@ -386,13 +334,12 @@ class ActiveProfilingProcessor:
         # Finally, use remaining CPU memory for resident partitions
         distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
         
-        # New constraint: Check if disk storage exceeds 50% of total
         weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
         cache_on_disk_percent = 100 - distribution["cache_gpu_percent"] - distribution["cache_cpu_percent"]
         weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
         cache_on_disk = (cache_on_disk_percent / 100) * cache_size
         total_on_disk = weight_on_disk + cache_on_disk
-        max_allowed_on_disk = 0.3 * (self.total_weight_gb + cache_size)
+        max_allowed_on_disk = 0.6 * (self.total_weight_gb + cache_size)
         
         if total_on_disk > max_allowed_on_disk:
             print(f"Warning: Disk storage constraint violated. Adjusting configuration.")
@@ -565,7 +512,7 @@ class ActiveProfilingProcessor:
             0,                            # resident_partitions coefficient
             0,                            # max_latency coefficient
         ]
-        b_disk_limit = -0.3 * (self.total_weight_gb + cache_size)
+        b_disk_limit = -0.6 * (self.total_weight_gb + cache_size)
 
         # Combine all constraints
         A_ub = np.array(
@@ -627,7 +574,7 @@ class ActiveProfilingProcessor:
                 weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
                 cache_on_disk = (cache_on_disk_percent / 100) * cache_size
                 total_on_disk = weight_on_disk + cache_on_disk
-                max_allowed_on_disk = 0.5 * (self.total_weight_gb + cache_size)
+                max_allowed_on_disk = 0.6 * (self.total_weight_gb + cache_size)
                 
                 if total_on_disk > max_allowed_on_disk + 0.1:  # Add small tolerance for floating point errors
                     print(f"Warning: Disk storage constraint violated. Total on disk: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
@@ -778,7 +725,7 @@ class ActiveProfilingProcessor:
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256]
+        batch_sizes = [192, 224, 256]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -837,10 +784,10 @@ class ActiveProfilingProcessor:
                 if predicted_config:
                     print("\nTrying model-predicted configuration:")
                     print(f"- Batch size: {predicted_config['batch_size']}")
-                    print(f"- Cache GPU%: {predicted_config['cache_gpu_percent']}")
-                    print(f"- Cache CPU%: {predicted_config['cache_cpu_percent']}")
                     print(f"- Weight GPU%: {predicted_config['w_gpu_percent']}")
                     print(f"- Weight CPU%: {predicted_config['w_cpu_percent']}")
+                    print(f"- Cache GPU%: {predicted_config['cache_gpu_percent']}")
+                    print(f"- Cache CPU%: {predicted_config['cache_cpu_percent']}")
                     print(f"- Resident partitions: {predicted_config['resident_partitions']}")
                     print(f"- Predicted inference time: {predicted_config['predicted_inf_latency']:.3f}s")
                     print(f"- Predicted query time: {predicted_config['predicted_query_latency']:.3f}s")
@@ -994,86 +941,7 @@ class ActiveProfilingProcessor:
                                 distribution["resident_partitions"] += 1
                     else:
                         break
-                else:
-                    error_type = result.get("error")
-                    cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
-                    available_gpu_memory = (
-                        self.gpu_memory_available(batch_size)
-                        - distribution["cache_gpu_percent"] * cache_size / 10
-                        - distribution["w_gpu_percent"] * self.total_weight_gb / 100
-                    )
-                    if error_type == "gpu_oom" and available_gpu_memory < 0.3 * self.gpu_memory_gb:
-                        print("GPU memory exhausted, retrying with reduced tensors")
-                        # Calculate available CPU memory
-                        used_cpu_memory = (
-                            (self.total_weight_gb * distribution["w_cpu_percent"] / 100)
-                            + (cache_size * distribution["cache_cpu_percent"] / 100)
-                            + (distribution["resident_partitions"] * self.partition_size_gb)
-                        )
-                        available_cpu_memory = self.total_cpu_gb - used_cpu_memory
-
-                        # Then try to move cache from GPU first
-                        remove_gpu_tensor_gb = 2
-                        remove_cpu_tensor_gb = 5
-                        if distribution["cache_gpu_percent"] * cache_size / 100 > remove_gpu_tensor_gb:
-                            reduction = int(remove_gpu_tensor_gb / cache_size * 100)
-                            distribution["cache_gpu_percent"] -= reduction
-
-                            # Calculate how much can fit in CPU
-                            if available_cpu_memory >= remove_gpu_tensor_gb:
-                                # Can fit in CPU
-                                distribution["cache_cpu_percent"] += reduction
-                                available_cpu_memory -= remove_gpu_tensor_gb
-                            else:
-                                # Can only fit part in CPU, rest goes to disk
-                                cpu_possible_percent = int((available_cpu_memory / cache_size) * 100)
-                                distribution["cache_cpu_percent"] += cpu_possible_percent
-                                # Rest implicitly goes to disk
-                                available_cpu_memory = 0
-
-                        # Try to move weights if needed
-                        elif distribution["w_gpu_percent"] * self.total_weight_gb / 100 > remove_cpu_tensor_gb:
-                            reduction = int(remove_cpu_tensor_gb / self.total_weight_gb * 100)
-                            distribution["w_gpu_percent"] -= reduction
-
-                            # Calculate how much can fit in CPU
-                            if available_cpu_memory >= remove_cpu_tensor_gb:
-                                # Can fit in CPU
-                                distribution["w_cpu_percent"] += reduction
-                                available_cpu_memory -= remove_cpu_tensor_gb
-                            else:
-                                # Can only fit part in CPU, rest goes to disk
-                                cpu_possible_percent = int((available_cpu_memory / self.total_weight_gb) * 100)
-                                distribution["w_cpu_percent"] += cpu_possible_percent
-                                # Rest implicitly goes to disk
-                                available_cpu_memory = 0
-                        else:
-                            break
-                    else:
-                        print("CPU memory exhausted, retrying with reduced tensors and partitions")
-                        # Reduce CPU usage
-                        if best_config and best_config["avg_query_time"] < best_config["avg_gen_time"]:
-                            if distribution["resident_partitions"] > 0:
-                                distribution["resident_partitions"] -= 1
-                            elif distribution["cache_cpu_percent"] * cache_size / 100 > 10:
-                                reduction = int(10 / cache_size * 100)
-                                distribution["cache_cpu_percent"] -= reduction
-                            elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
-                                reduction = int(10 / self.total_weight_gb * 100)
-                                distribution["w_cpu_percent"] -= reduction
-                            else:
-                                break
-                        else:
-                            if distribution["cache_cpu_percent"] * cache_size / 100 > 10:
-                                reduction = int(10 / cache_size * 100)
-                                distribution["cache_cpu_percent"] -= reduction
-                            elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
-                                reduction = int(10 / self.total_weight_gb * 100)
-                                distribution["w_cpu_percent"] -= reduction
-                            elif distribution["resident_partitions"] > 0:
-                                distribution["resident_partitions"] -= 1
-                            else:
-                                break
+                
 
                 retries += 1
 
