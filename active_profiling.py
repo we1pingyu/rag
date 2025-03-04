@@ -22,7 +22,7 @@ from pymilvus import Partition
 from sklearn.model_selection import train_test_split
 from itertools import product
 
-learning_samples = 5
+learning_samples = 10
 
 
 class ActiveProfilingProcessor:
@@ -37,7 +37,7 @@ class ActiveProfilingProcessor:
         partition_names: List[str],
         total_cpu_gb: int = 128,
         gpu_memory_gb: int = 24,
-        safety_margin: float = 0.8,
+        safety_margin: float = 0.9,
     ):
         self.questions = questions
         self.embedding_model = embedding_model
@@ -47,7 +47,7 @@ class ActiveProfilingProcessor:
         self.collection = collection
         self.partition_names = partition_names
         self.gpu_memory_gb = gpu_memory_gb
-        self.total_cpu_gb = total_cpu_gb * safety_margin - self.gpu_memory_gb  # Leave some swap space
+        self.total_cpu_gb = total_cpu_gb * safety_margin  # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
@@ -384,9 +384,76 @@ class ActiveProfilingProcessor:
             distribution["cache_cpu_percent"] = 0
 
         # Finally, use remaining CPU memory for resident partitions
-        distribution["resident_partitions"] = min(9, max(0, int(available_cpu_memory / self.partition_size_gb)))
+        distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
+        
+        # New constraint: Check if disk storage exceeds 50% of total
+        weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
+        cache_on_disk_percent = 100 - distribution["cache_gpu_percent"] - distribution["cache_cpu_percent"]
+        weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
+        cache_on_disk = (cache_on_disk_percent / 100) * cache_size
+        total_on_disk = weight_on_disk + cache_on_disk
+        max_allowed_on_disk = 0.3 * (self.total_weight_gb + cache_size)
+        
+        if total_on_disk > max_allowed_on_disk:
+            print(f"Warning: Disk storage constraint violated. Adjusting configuration.")
+            print(f"Current disk usage: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
+            
+            # We need to reduce disk usage by moving more to GPU/CPU
+            excess_disk_gb = total_on_disk - max_allowed_on_disk
+            
+            # Try to move weight from disk to CPU/GPU first
+            if weight_on_disk_percent > 0:
+                # How much weight percentage needs to be moved from disk (as percentage of total weight)
+                weight_to_move_percent = min(weight_on_disk_percent, 
+                                        int(excess_disk_gb / self.total_weight_gb * 100))
+                
+                # Attempt to move to CPU first
+                cpu_capacity_percent = max(0, 100 - distribution["w_cpu_percent"])
+                weight_to_cpu_percent = min(weight_to_move_percent, cpu_capacity_percent)
+                distribution["w_cpu_percent"] += weight_to_cpu_percent
+                weight_to_move_percent -= weight_to_cpu_percent
+                
+                # If needed, try to move remaining weight to GPU
+                if weight_to_move_percent > 0:
+                    gpu_capacity_percent = max(0, 100 - distribution["w_gpu_percent"])
+                    weight_to_gpu_percent = min(weight_to_move_percent, gpu_capacity_percent)
+                    distribution["w_gpu_percent"] += weight_to_gpu_percent
+            
+            # Recalculate disk usage after weight adjustments
+            weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
+            weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
+            total_on_disk = weight_on_disk + cache_on_disk
+            
+            # If still exceeding limit, try to move cache from disk to CPU/GPU
+            if total_on_disk > max_allowed_on_disk and cache_on_disk_percent > 0:
+                excess_disk_gb = total_on_disk - max_allowed_on_disk
+                cache_to_move_percent = min(cache_on_disk_percent, 
+                                        int(excess_disk_gb / cache_size * 100))
+                
+                # Attempt to move to CPU first
+                cpu_capacity_percent = max(0, 100 - distribution["cache_cpu_percent"])
+                cache_to_cpu_percent = min(cache_to_move_percent, cpu_capacity_percent)
+                distribution["cache_cpu_percent"] += cache_to_cpu_percent
+                cache_to_move_percent -= cache_to_cpu_percent
+                
+                # If needed, try to move remaining cache to GPU
+                if cache_to_move_percent > 0:
+                    gpu_capacity_percent = max(0, 100 - distribution["cache_gpu_percent"])
+                    cache_to_gpu_percent = min(cache_to_move_percent, gpu_capacity_percent)
+                    distribution["cache_gpu_percent"] += cache_to_gpu_percent
+            
+            # Final check to verify we've met the constraint
+            weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
+            cache_on_disk_percent = 100 - distribution["cache_gpu_percent"] - distribution["cache_cpu_percent"]
+            weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
+            cache_on_disk = (cache_on_disk_percent / 100) * cache_size
+            total_on_disk = weight_on_disk + cache_on_disk
+            
+            print(f"After adjustment: Disk usage: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
+            if total_on_disk > max_allowed_on_disk:
+                print("Warning: Could not fully satisfy disk storage constraint.")
+        
         return distribution
-
     def find_optimal_config_with_model(
         self,
         batch_size: int,
@@ -480,6 +547,25 @@ class ActiveProfilingProcessor:
         # Rearranged: -w_gpu_percent - w_cpu_percent <= -20
         A_weight_min = [-1, -1, 0, 0, 0, 0]
         b_weight_min = -40
+        
+        # 9. NEW CONSTRAINT: Weight and cache on disk <= 50% of total weight and cache
+        # Disk weight = (100 - w_gpu - w_cpu) * total_weight_gb / 100
+        # Disk cache = (100 - cache_gpu - cache_cpu) * cache_size / 100
+        # Constraint: Disk weight + Disk cache <= 0.5 * (total_weight_gb + cache_size)
+        # Expanded: (100 - w_gpu - w_cpu) * total_weight_gb / 100 + (100 - cache_gpu - cache_cpu) * cache_size / 100 <= 0.5 * (total_weight_gb + cache_size)
+        # Simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <= 
+        #             0.5 * (total_weight_gb + cache_size) - total_weight_gb - cache_size
+        # Further simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <= 
+        #                     -0.5 * (total_weight_gb + cache_size)
+        A_disk_limit = [
+            -self.total_weight_gb / 100,  # w_gpu_percent coefficient
+            -self.total_weight_gb / 100,  # w_cpu_percent coefficient
+            -cache_size / 100,            # cache_gpu_percent coefficient
+            -cache_size / 100,            # cache_cpu_percent coefficient
+            0,                            # resident_partitions coefficient
+            0,                            # max_latency coefficient
+        ]
+        b_disk_limit = -0.3 * (self.total_weight_gb + cache_size)
 
         # Combine all constraints
         A_ub = np.array(
@@ -492,6 +578,7 @@ class ActiveProfilingProcessor:
                 A_cpu_mem,
                 A_cache_min,
                 A_weight_min,
+                A_disk_limit,  # Added the new disk storage constraint
             ]
         )
         b_ub = np.array(
@@ -504,6 +591,7 @@ class ActiveProfilingProcessor:
                 b_cpu_mem,
                 b_cache_min,
                 b_weight_min,
+                b_disk_limit,  # Added the new disk storage constraint limit
             ]
         )
 
@@ -516,7 +604,7 @@ class ActiveProfilingProcessor:
             (0, 100),  # w_cpu_percent
             (0, 100),  # cache_gpu_percent
             (0, 100),  # cache_cpu_percent
-            (0, min(9, len(self.partition_names))),  # resident_partitions
+            (0, len(self.partition_names)),  # resident_partitions
             (0, None),  # max_latency (no upper bound)
         ]
 
@@ -532,6 +620,47 @@ class ActiveProfilingProcessor:
                 cache_cpu_percent = round(result.x[3])
                 resident_partitions = round(result.x[4])
                 max_latency = result.x[5]
+
+                # Double-check the disk storage constraint is satisfied
+                weight_on_disk_percent = 100 - w_gpu_percent - w_cpu_percent
+                cache_on_disk_percent = 100 - cache_gpu_percent - cache_cpu_percent
+                weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
+                cache_on_disk = (cache_on_disk_percent / 100) * cache_size
+                total_on_disk = weight_on_disk + cache_on_disk
+                max_allowed_on_disk = 0.5 * (self.total_weight_gb + cache_size)
+                
+                if total_on_disk > max_allowed_on_disk + 0.1:  # Add small tolerance for floating point errors
+                    print(f"Warning: Disk storage constraint violated. Total on disk: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
+                    # Adjust the solution to meet the constraint
+                    # This is a simplistic approach - we could use a more sophisticated method if needed
+                    if weight_on_disk > 0:
+                        additional_weight_needed = min(weight_on_disk_percent, 
+                                                round((total_on_disk - max_allowed_on_disk) / self.total_weight_gb * 100))
+                        # First try to put more weight on CPU
+                        if w_cpu_percent + additional_weight_needed <= 100:
+                            w_cpu_percent += additional_weight_needed
+                        # If that's not enough, try GPU
+                        else:
+                            remaining = additional_weight_needed - (100 - w_cpu_percent)
+                            w_cpu_percent = 100
+                            w_gpu_percent += remaining
+                    
+                    # If we still haven't met the constraint, adjust cache percentages
+                    weight_on_disk_percent = 100 - w_gpu_percent - w_cpu_percent
+                    weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
+                    total_on_disk = weight_on_disk + cache_on_disk
+                    
+                    if total_on_disk > max_allowed_on_disk + 0.1 and cache_on_disk > 0:
+                        additional_cache_needed = min(cache_on_disk_percent,
+                                                round((total_on_disk - max_allowed_on_disk) / cache_size * 100))
+                        # First try to put more cache on CPU
+                        if cache_cpu_percent + additional_cache_needed <= 100:
+                            cache_cpu_percent += additional_cache_needed
+                        # If that's not enough, try GPU
+                        else:
+                            remaining = additional_cache_needed - (100 - cache_cpu_percent)
+                            cache_cpu_percent = 100
+                            cache_gpu_percent += remaining
 
                 # Predict latencies using the optimized configuration
                 X_inf = np.array(
@@ -858,11 +987,11 @@ class ActiveProfilingProcessor:
                             if distribution["cache_cpu_percent"] * cache_size / 100 > self.partition_size_gb:
                                 reduction = int(self.partition_size_gb / cache_size * 100)
                                 distribution["cache_cpu_percent"] -= reduction
-                                distribution["resident_partitions"] = min(9, distribution["resident_partitions"] + 1)
+                                distribution["resident_partitions"] += 1
                             elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > self.partition_size_gb:
                                 reduction = int(self.partition_size_gb / self.total_weight_gb * 100)
                                 distribution["w_cpu_percent"] -= reduction
-                                distribution["resident_partitions"] = min(9, distribution["resident_partitions"] + 1)
+                                distribution["resident_partitions"] += 1
                     else:
                         break
                 else:
