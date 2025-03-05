@@ -110,7 +110,7 @@ if __name__ == "__main__":
         print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
         partition_size_gb = get_milvus_memory_usage()
         available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
-        resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
+        # resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
         print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
 
         # 加载 resident partitions
@@ -222,7 +222,7 @@ if __name__ == "__main__":
                 model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
-                partition_names=["partition_0"],
+                partition_names=partition_names,
                 w_gpu_percent=args.percent[0],
                 w_cpu_percent=args.percent[1],
                 cache_gpu_percent=args.percent[2],

@@ -46,13 +46,13 @@ class ActiveProfilingProcessor:
         self.collection = collection
         self.partition_names = partition_names
         self.gpu_memory_gb = gpu_memory_gb * 0.9
-        self.total_cpu_gb = total_cpu_gb * 0.7  
+        self.total_cpu_gb = total_cpu_gb * 0.7  # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
         self.prev_gen_time = 3000
 
         # Get model requirements
-        self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
+        self.total_weight_gb = 2 * self.model_config.model_bytes() / (1024**3)
         self.compute_weight_gb = self.total_weight_gb / self.model_config.num_hidden_layers
         print(f"Model weight size: {self.total_weight_gb:.2f} GB")
         print(f"Estimated cache size per batch: {self.estimate_cache_size(1):.2f} GB")
@@ -66,11 +66,11 @@ class ActiveProfilingProcessor:
         return {"cpu_used": memory_info.rss / (1024**3), "gpu_used": gpu_memory}
 
     def estimate_hidden_size(self, batch_size: int) -> float:
-        return self.model_config.hidden_bytes(batch_size, 512 + 16) / (1024**3)
+        return 2 * self.model_config.hidden_bytes(batch_size, 512 + 16) / (1024**3)
 
     def estimate_cache_size(self, batch_size: int, layers=1) -> float:
         """Estimate cache size in GB for given batch size"""
-        return self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
+        return 2 * self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
 
     def estimate_attention_working_memory(self, batch_size: int) -> float:
         """Estimate attention mechanism working memory in GB for given batch size
@@ -86,21 +86,21 @@ class ActiveProfilingProcessor:
         seq_len = 512 + 16  # Current fixed sequence length in the processor
 
         # Memory in bytes (following cost_model calculations)
-        # QKV projections: 3 projections each of size batch_size * seq_len * input_dim * 4 bytes (assuming float32)
-        qkv_memory = 3 * batch_size * seq_len * input_dim * 4
+        # QKV projections: 3 projections each of size batch_size * seq_len * input_dim * 2 bytes (assuming float16)
+        qkv_memory = 3 * batch_size * seq_len * input_dim * 2
 
         # Attention calculation:
-        # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 4 bytes
-        # - Attention scores: batch_size * n_head * seq_len * seq_len * 4 bytes
-        # - Attention output: batch_size * seq_len * input_dim * 4 bytes
+        # - Q, K, V split into heads: 3 * batch_size * n_head * seq_len * head_dim * 2 bytes
+        # - Attention scores: batch_size * n_head * seq_len * seq_len * 2 bytes
+        # - Attention output: batch_size * seq_len * input_dim * 2 bytes
         attention_memory = (
-            (3 * batch_size * n_head * seq_len * head_dim * 4)
-            + (batch_size * n_head * seq_len * seq_len * 4)
-            + (batch_size * seq_len * input_dim * 4)
+            (3 * batch_size * n_head * seq_len * head_dim * 2)
+            + (batch_size * n_head * seq_len * seq_len * 2)
+            + (batch_size * seq_len * input_dim * 2)
         )
 
-        # Output projection: batch_size * seq_len * input_dim * 4 bytes
-        output_memory = batch_size * seq_len * input_dim * 4
+        # Output projection: batch_size * seq_len * input_dim * 2 bytes
+        output_memory = batch_size * seq_len * input_dim * 2
 
         total_memory_bytes = qkv_memory + attention_memory + output_memory
         return total_memory_bytes / (1024**3)  # Convert to GB
@@ -115,14 +115,14 @@ class ActiveProfilingProcessor:
         seq_len = 512 + 16  # Current fixed sequence length
 
         # Following cost_model calculations:
-        # - First projection (input_dim to intermediate_size): batch_size * seq_len * intermediate_size * 4 bytes
-        mlp1_memory = batch_size * seq_len * intermediate_size * 4
+        # - First projection (input_dim to intermediate_size): batch_size * seq_len * intermediate_size * 2 bytes
+        mlp1_memory = batch_size * seq_len * intermediate_size * 2
 
-        # - Second projection (intermediate_size to input_dim): batch_size * seq_len * input_dim * 4 bytes
-        mlp2_memory = batch_size * seq_len * input_dim * 4
+        # - Second projection (intermediate_size to input_dim): batch_size * seq_len * input_dim * 2 bytes
+        mlp2_memory = batch_size * seq_len * input_dim * 2
 
-        # - Intermediate activations: batch_size * seq_len * intermediate_size * 4 bytes
-        activation_memory = batch_size * seq_len * intermediate_size * 4
+        # - Intermediate activations: batch_size * seq_len * intermediate_size * 2 bytes
+        activation_memory = batch_size * seq_len * intermediate_size * 2
 
         total_memory_bytes = mlp1_memory + mlp2_memory + activation_memory
         return total_memory_bytes / (1024**3)  # Convert to GB
@@ -150,7 +150,7 @@ class ActiveProfilingProcessor:
         batch_size_split, _ = split_batch(batch_size)
         # Original computations
         weights_memory = self.compute_weight_gb * 2  # Compute weight allocation
-        cache_memory = 2 * self.estimate_cache_size(batch_size_split)  # KV cache
+        cache_memory = self.estimate_cache_size(batch_size_split)  # KV cache
         hidden_memory = self.estimate_hidden_size(batch_size)  # Hidden states
 
         # New working memory computations
@@ -275,8 +275,6 @@ class ActiveProfilingProcessor:
             "success": True,
         }
 
-       
-
     def calculate_memory_distribution(
         self, batch_size: int, available_gpu_memory: float, available_cpu_memory: float
     ) -> Dict[str, int]:
@@ -333,74 +331,74 @@ class ActiveProfilingProcessor:
 
         # Finally, use remaining CPU memory for resident partitions
         distribution["resident_partitions"] = max(0, int(available_cpu_memory / self.partition_size_gb))
-        
+
+        # New constraint: Check if disk storage exceeds 50% of total
         weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
         cache_on_disk_percent = 100 - distribution["cache_gpu_percent"] - distribution["cache_cpu_percent"]
         weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
         cache_on_disk = (cache_on_disk_percent / 100) * cache_size
         total_on_disk = weight_on_disk + cache_on_disk
-        max_allowed_on_disk = 0.6 * (self.total_weight_gb + cache_size)
-        
+        max_allowed_on_disk = 0.3 * (self.total_weight_gb + cache_size)
+
         if total_on_disk > max_allowed_on_disk:
             print(f"Warning: Disk storage constraint violated. Adjusting configuration.")
             print(f"Current disk usage: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
-            
+
             # We need to reduce disk usage by moving more to GPU/CPU
             excess_disk_gb = total_on_disk - max_allowed_on_disk
-            
+
             # Try to move weight from disk to CPU/GPU first
             if weight_on_disk_percent > 0:
                 # How much weight percentage needs to be moved from disk (as percentage of total weight)
-                weight_to_move_percent = min(weight_on_disk_percent, 
-                                        int(excess_disk_gb / self.total_weight_gb * 100))
-                
+                weight_to_move_percent = min(weight_on_disk_percent, int(excess_disk_gb / self.total_weight_gb * 100))
+
                 # Attempt to move to CPU first
                 cpu_capacity_percent = max(0, 100 - distribution["w_cpu_percent"])
                 weight_to_cpu_percent = min(weight_to_move_percent, cpu_capacity_percent)
                 distribution["w_cpu_percent"] += weight_to_cpu_percent
                 weight_to_move_percent -= weight_to_cpu_percent
-                
+
                 # If needed, try to move remaining weight to GPU
                 if weight_to_move_percent > 0:
                     gpu_capacity_percent = max(0, 100 - distribution["w_gpu_percent"])
                     weight_to_gpu_percent = min(weight_to_move_percent, gpu_capacity_percent)
                     distribution["w_gpu_percent"] += weight_to_gpu_percent
-            
+
             # Recalculate disk usage after weight adjustments
             weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
             weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
             total_on_disk = weight_on_disk + cache_on_disk
-            
+
             # If still exceeding limit, try to move cache from disk to CPU/GPU
             if total_on_disk > max_allowed_on_disk and cache_on_disk_percent > 0:
                 excess_disk_gb = total_on_disk - max_allowed_on_disk
-                cache_to_move_percent = min(cache_on_disk_percent, 
-                                        int(excess_disk_gb / cache_size * 100))
-                
+                cache_to_move_percent = min(cache_on_disk_percent, int(excess_disk_gb / cache_size * 100))
+
                 # Attempt to move to CPU first
                 cpu_capacity_percent = max(0, 100 - distribution["cache_cpu_percent"])
                 cache_to_cpu_percent = min(cache_to_move_percent, cpu_capacity_percent)
                 distribution["cache_cpu_percent"] += cache_to_cpu_percent
                 cache_to_move_percent -= cache_to_cpu_percent
-                
+
                 # If needed, try to move remaining cache to GPU
                 if cache_to_move_percent > 0:
                     gpu_capacity_percent = max(0, 100 - distribution["cache_gpu_percent"])
                     cache_to_gpu_percent = min(cache_to_move_percent, gpu_capacity_percent)
                     distribution["cache_gpu_percent"] += cache_to_gpu_percent
-            
+
             # Final check to verify we've met the constraint
             weight_on_disk_percent = 100 - distribution["w_gpu_percent"] - distribution["w_cpu_percent"]
             cache_on_disk_percent = 100 - distribution["cache_gpu_percent"] - distribution["cache_cpu_percent"]
             weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
             cache_on_disk = (cache_on_disk_percent / 100) * cache_size
             total_on_disk = weight_on_disk + cache_on_disk
-            
+
             print(f"After adjustment: Disk usage: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
             if total_on_disk > max_allowed_on_disk:
                 print("Warning: Could not fully satisfy disk storage constraint.")
-        
+
         return distribution
+
     def find_optimal_config_with_model(
         self,
         batch_size: int,
@@ -494,25 +492,25 @@ class ActiveProfilingProcessor:
         # Rearranged: -w_gpu_percent - w_cpu_percent <= -20
         A_weight_min = [-1, -1, 0, 0, 0, 0]
         b_weight_min = -40
-        
+
         # 9. NEW CONSTRAINT: Weight and cache on disk <= 50% of total weight and cache
         # Disk weight = (100 - w_gpu - w_cpu) * total_weight_gb / 100
         # Disk cache = (100 - cache_gpu - cache_cpu) * cache_size / 100
         # Constraint: Disk weight + Disk cache <= 0.5 * (total_weight_gb + cache_size)
         # Expanded: (100 - w_gpu - w_cpu) * total_weight_gb / 100 + (100 - cache_gpu - cache_cpu) * cache_size / 100 <= 0.5 * (total_weight_gb + cache_size)
-        # Simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <= 
+        # Simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <=
         #             0.5 * (total_weight_gb + cache_size) - total_weight_gb - cache_size
-        # Further simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <= 
+        # Further simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <=
         #                     -0.5 * (total_weight_gb + cache_size)
         A_disk_limit = [
             -self.total_weight_gb / 100,  # w_gpu_percent coefficient
             -self.total_weight_gb / 100,  # w_cpu_percent coefficient
-            -cache_size / 100,            # cache_gpu_percent coefficient
-            -cache_size / 100,            # cache_cpu_percent coefficient
-            0,                            # resident_partitions coefficient
-            0,                            # max_latency coefficient
+            -cache_size / 100,  # cache_gpu_percent coefficient
+            -cache_size / 100,  # cache_cpu_percent coefficient
+            0,  # resident_partitions coefficient
+            0,  # max_latency coefficient
         ]
-        b_disk_limit = -0.6 * (self.total_weight_gb + cache_size)
+        b_disk_limit = -0.3 * (self.total_weight_gb + cache_size)
 
         # Combine all constraints
         A_ub = np.array(
@@ -574,15 +572,19 @@ class ActiveProfilingProcessor:
                 weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
                 cache_on_disk = (cache_on_disk_percent / 100) * cache_size
                 total_on_disk = weight_on_disk + cache_on_disk
-                max_allowed_on_disk = 0.6 * (self.total_weight_gb + cache_size)
-                
+                max_allowed_on_disk = 0.5 * (self.total_weight_gb + cache_size)
+
                 if total_on_disk > max_allowed_on_disk + 0.1:  # Add small tolerance for floating point errors
-                    print(f"Warning: Disk storage constraint violated. Total on disk: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
+                    print(
+                        f"Warning: Disk storage constraint violated. Total on disk: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB"
+                    )
                     # Adjust the solution to meet the constraint
                     # This is a simplistic approach - we could use a more sophisticated method if needed
                     if weight_on_disk > 0:
-                        additional_weight_needed = min(weight_on_disk_percent, 
-                                                round((total_on_disk - max_allowed_on_disk) / self.total_weight_gb * 100))
+                        additional_weight_needed = min(
+                            weight_on_disk_percent,
+                            round((total_on_disk - max_allowed_on_disk) / self.total_weight_gb * 100),
+                        )
                         # First try to put more weight on CPU
                         if w_cpu_percent + additional_weight_needed <= 100:
                             w_cpu_percent += additional_weight_needed
@@ -591,15 +593,16 @@ class ActiveProfilingProcessor:
                             remaining = additional_weight_needed - (100 - w_cpu_percent)
                             w_cpu_percent = 100
                             w_gpu_percent += remaining
-                    
+
                     # If we still haven't met the constraint, adjust cache percentages
                     weight_on_disk_percent = 100 - w_gpu_percent - w_cpu_percent
                     weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
                     total_on_disk = weight_on_disk + cache_on_disk
-                    
+
                     if total_on_disk > max_allowed_on_disk + 0.1 and cache_on_disk > 0:
-                        additional_cache_needed = min(cache_on_disk_percent,
-                                                round((total_on_disk - max_allowed_on_disk) / cache_size * 100))
+                        additional_cache_needed = min(
+                            cache_on_disk_percent, round((total_on_disk - max_allowed_on_disk) / cache_size * 100)
+                        )
                         # First try to put more cache on CPU
                         if cache_cpu_percent + additional_cache_needed <= 100:
                             cache_cpu_percent += additional_cache_needed
@@ -725,7 +728,7 @@ class ActiveProfilingProcessor:
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [192, 224, 256]
+        batch_sizes = [64, 96, 128, 160, 192, 224, 256]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
@@ -784,10 +787,10 @@ class ActiveProfilingProcessor:
                 if predicted_config:
                     print("\nTrying model-predicted configuration:")
                     print(f"- Batch size: {predicted_config['batch_size']}")
-                    print(f"- Weight GPU%: {predicted_config['w_gpu_percent']}")
-                    print(f"- Weight CPU%: {predicted_config['w_cpu_percent']}")
                     print(f"- Cache GPU%: {predicted_config['cache_gpu_percent']}")
                     print(f"- Cache CPU%: {predicted_config['cache_cpu_percent']}")
+                    print(f"- Weight GPU%: {predicted_config['w_gpu_percent']}")
+                    print(f"- Weight CPU%: {predicted_config['w_cpu_percent']}")
                     print(f"- Resident partitions: {predicted_config['resident_partitions']}")
                     print(f"- Predicted inference time: {predicted_config['predicted_inf_latency']:.3f}s")
                     print(f"- Predicted query time: {predicted_config['predicted_query_latency']:.3f}s")
@@ -941,7 +944,6 @@ class ActiveProfilingProcessor:
                                 distribution["resident_partitions"] += 1
                     else:
                         break
-                
 
                 retries += 1
 
