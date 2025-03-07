@@ -30,9 +30,12 @@ class VLLMProcessor:
         resident_partitions: int = 0,
         base_time: float = None,
         max_new_tokens: int = 16,
-        gpu_memory_utilization: float = 0.85,
+        total_cpu_gb: int = 166,
+        gpu_memory_gb: int = 12,
+        gpu_memory_utilization: float = 0.5,
+        partition_size_gb: int = 10,
         seed: int = 42,
-        vllm_batch_size: Optional[int] = None,  # Max concurrent requests for VLLM
+        vllm_batch_size: Optional[int] = None,  # Max concurrent requests for VLLM'
     ):
         self.questions = [
             Question(question_text=q["question"], doc_id=q["doc_id"], arrival_time=0.0) for q in questions
@@ -52,6 +55,8 @@ class VLLMProcessor:
         self.max_new_tokens = max_new_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
         self.vllm_batch_size = vllm_batch_size if vllm_batch_size else batch_size
+        self.total_cpu_gb = total_cpu_gb - (resident_partitions + 1) * partition_size_gb
+        self.gpu_memory_gb = gpu_memory_gb
 
         # New interval tracking variables
         self.interval_question_count = []
@@ -86,7 +91,7 @@ class VLLMProcessor:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 tensor_parallel_size=1,  # Adjust if using multiple GPUs
                 trust_remote_code=True,
-                cpu_offload_gb=100,
+                cpu_offload_gb=self.total_cpu_gb,
                 max_model_len=512,
             )
             print("VLLM model initialized successfully")
@@ -206,6 +211,13 @@ class VLLMProcessor:
         )
         self.timing_stats.update(updated_timing_stats)
 
+        # Record query completion time
+        query_completion_time = time.time()
+
+        # Attach query completion time to each result
+        for result in batch_results:
+            result["query_completion_time"] = query_completion_time
+
         return batch, batch_results
 
     def submit_to_vllm(self, batch, batch_results):
@@ -225,11 +237,11 @@ class VLLMProcessor:
             # Store metadata for retrieval
             metadata_list.append(
                 {
-                    "question": question, 
+                    "question": question,
                     "result": result,  # Keep the original result object
                     "prompt": prompt,  # Store the full prompt
-                    "generation_start_time": time.time(), 
-                    "request_id": request_id
+                    "generation_start_time": time.time(),
+                    "request_id": request_id,
                 }
             )
 
@@ -253,10 +265,10 @@ class VLLMProcessor:
 
             # Get the model's output
             model_output = output.outputs[0].text.strip()
-            
+
             # Combine prompt and response as the complete response
             complete_response = f"{full_prompt} {model_output}"
-            
+
             # Store this as the llm_response
             result["llm_response"] = complete_response
 
@@ -266,7 +278,9 @@ class VLLMProcessor:
                     "question": question,
                     "result": result,  # Use the modified original result object
                     "arrival_time": question.arrival_time,
+                    "query_completion_time": result.get("query_completion_time", time.time()),  # Get stored query time
                     "completion_time": completion_time,
+                    "interval_id": getattr(question, "interval_id", 0),  # Ensure interval_id is available
                 }
             )
 
@@ -306,6 +320,56 @@ class VLLMProcessor:
 
         print("VLLM generation worker thread stopped")
 
+    def export_timing_to_csv(self):
+        """Export all timing information to a CSV file"""
+        import csv
+
+        csv_filename = f"{self.model_name}_question_timings_efficient.csv"
+        print(f"Exporting timing information to {csv_filename}")
+
+        # Sort results by question arrival time
+        sorted_results = sorted(self.results, key=lambda x: x["arrival_time"])
+
+        with open(csv_filename, "w", newline="") as csvfile:
+            fieldnames = [
+                "question_id",
+                "interval_id",
+                "arrival_rate",
+                "arrival_time",
+                "query_completion_time",
+                "generation_completion_time",
+                "batch_size",
+                "resident_partitions",
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+            writer.writeheader()
+            for i, result in enumerate(sorted_results):
+                question = result["question"]
+
+                # Calculate relative times from base_time
+                arrival_time_rel = result["arrival_time"] - self.base_time
+                query_completion_time_rel = result["query_completion_time"] - self.base_time
+                generation_completion_time_rel = result["completion_time"] - self.base_time
+
+                # Get interval ID and corresponding arrival rate
+                interval_id = getattr(question, "interval_id", 0)
+                arrival_rate = self.arrival_rates[interval_id] if interval_id < len(self.arrival_rates) else 0
+
+                writer.writerow(
+                    {
+                        "question_id": i,  # Use index as question ID
+                        "interval_id": interval_id,
+                        "arrival_rate": arrival_rate,
+                        "arrival_time": f"{arrival_time_rel:.4f}",
+                        "query_completion_time": f"{query_completion_time_rel:.4f}",
+                        "generation_completion_time": f"{generation_completion_time_rel:.4f}",
+                        "batch_size": self.batch_size,
+                        "resident_partitions": self.resident_partitions,
+                    }
+                )
+
+        print(f"Successfully exported {len(sorted_results)} question records to {csv_filename}")
 
     # Remove the check_completed_generations method since it relies on a non-existent function
     # And modify the run method to remove references to it
@@ -486,6 +550,8 @@ class VLLMProcessor:
         print(f"Questions by interval: {self.interval_question_count}")
         print(f"Completions by interval: {self.interval_completion_count}")
         print("============================\n")
+        print("Exporting timing results to CSV...")
+        self.export_timing_to_csv()
 
     def get_sorted_results(self):
         """Get results sorted by arrival time"""

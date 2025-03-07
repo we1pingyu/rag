@@ -185,12 +185,10 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
                     # Wait for current weight and cache to be ready
                     if weight_futures[k][j] is not None:
-                        this.env.disk.synchronize()
                         wait_stream_finish(weight_futures[k][j])
                         weight_futures[k][j] = None
 
                     if cache_futures[k][j] is not None:
-                        this.env.disk.synchronize()
                         wait_stream_finish(cache_futures[k][j])
                         cache_futures[k][j] = None
 

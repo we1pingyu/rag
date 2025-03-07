@@ -73,7 +73,7 @@ def print_memory_usage(prefix: str = "") -> None:
     print(f"{prefix}Memory Usage - RSS: {memory_info['rss']:.2f} GB, VMS: {memory_info['vms']:.2f} GB")
 
 
-def split_batch(batch_size, max_split_size=16):
+def split_batch(batch_size, max_split_size=32):
     if batch_size <= max_split_size:
         return batch_size, 1
 

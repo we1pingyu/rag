@@ -17,3 +17,5 @@ dynagen_offload_dir/
 *_data_*/
 *copy*
 meta-llama/
+*.pdf
+plot*

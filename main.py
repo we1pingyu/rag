@@ -110,7 +110,7 @@ if __name__ == "__main__":
         print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
         partition_size_gb = get_milvus_memory_usage()
         available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
-        # resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
+        resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
         print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
 
         # 加载 resident partitions
@@ -151,7 +151,7 @@ if __name__ == "__main__":
             processor = DynPipelineProcessor(
                 questions=all_questions[: args.total_questions],
                 batch_size=args.batch_size,
-                arrival_rates=[8],
+                arrival_rates=args.arrival_rates,
                 embedding_model=embedding_model,
                 model_name=args.model,
                 tokenizer=tokenizer,
@@ -160,7 +160,7 @@ if __name__ == "__main__":
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,
-                rate_change_interval=600,
+                rate_change_interval=args.rate_change_interval,
                 partition_size_gb=partition_size_gb,
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
@@ -170,8 +170,8 @@ if __name__ == "__main__":
             processor = BaselineProcessor(
                 questions=all_questions[: args.total_questions],
                 batch_size=args.batch_size,
-                arrival_rates=[2],
-                rate_change_interval=60,
+                arrival_rates=args.arrival_rates,
+                rate_change_interval=args.rate_change_interval,
                 embedding_model=embedding_model,
                 model_name=args.model,
                 tokenizer=tokenizer,
@@ -187,13 +187,13 @@ if __name__ == "__main__":
             processor = VLLMProcessor(
                 questions=all_questions[: args.total_questions],
                 batch_size=args.batch_size,
-                arrival_rates=[4],
-                rate_change_interval=60,
+                arrival_rates=args.arrival_rates,
+                rate_change_interval=args.rate_change_interval,
                 embedding_model=embedding_model,
                 model_name=args.model,  # Pass model name instead of model instance
                 tokenizer=tokenizer,
                 collection=collection,
-                partition_names=["partition_0"],
+                partition_names=partition_names,
                 timing_stats=timing_stats,
                 resident_partitions=args.resident_partitions,
                 base_time=total_start_time,

@@ -316,8 +316,8 @@ class TorchDevice:
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory, name="cache_")
-        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory, name="cache_")
+        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
 
     def mha(
@@ -751,8 +751,8 @@ class TorchDisk:
             policy.gpu_batch_size,
         )
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, np.float16, name="cache_")
-        v_cache = self.allocate(shape, np.float16, name="cache_")
+        k_cache = self.allocate(shape, np.float16)
+        v_cache = self.allocate(shape, np.float16)
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -890,8 +890,8 @@ class TorchMixedDevice(TorchMixedDeviceMemManager):
         lens = [len_gpu, len_cpu, len_disk]
 
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory, name="cache_")
-        v_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory, name="cache_")
+        k_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, np.float16, seg_lengths=lens, pin_memory=pin_memory)
         return k_cache, v_cache
 
 

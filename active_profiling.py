@@ -11,8 +11,8 @@ import os
 import shutil
 import random
 import json
-import glob
 import math
+import glob
 from scipy.optimize import linprog
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import List, Dict, Optional, Tuple
@@ -22,7 +22,8 @@ from pymilvus import Partition
 from sklearn.model_selection import train_test_split
 from itertools import product
 
-learning_samples = 10
+learning_samples = 5
+max_disk_percent = 0.7
 
 
 class ActiveProfilingProcessor:
@@ -45,7 +46,7 @@ class ActiveProfilingProcessor:
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
-        self.gpu_memory_gb = gpu_memory_gb * 0.9
+        self.gpu_memory_gb = gpu_memory_gb * 0.8
         self.total_cpu_gb = total_cpu_gb * 0.7  # Leave some swap space
         self.partition_size_gb = partition_size_gb
         self.loaded_partitions = set()
@@ -194,86 +195,142 @@ class ActiveProfilingProcessor:
         num_test_batches: int = 1,
     ) -> Optional[Dict]:
         """Try a specific configuration"""
+        thread_exceptions = []
 
-        batch_size_split, num_batch = split_batch(batch_size)
-        print(f"Available GPU memory: {self.gpu_memory_available(batch_size):.2f} GB")
-        print("Splitting batch into batches:", batch_size_split, ", num_batch: ", num_batch)
-        self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
-        self.model.update_weight(w_gpu_percent, w_cpu_percent)
-        actual_resident_partitions = self.update_resident_partitions(resident_partitions)
+        def exception_handler(args):
+            if isinstance(args.exc_value, (OSError, RuntimeError)) and (
+                "Cannot allocate memory" in str(args.exc_value) or "[Errno 12]" in str(args.exc_value)
+            ):
+                thread_exceptions.append(args)
 
-        timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
+        threading.excepthook = exception_handler
 
-        for i in range(num_test_batches):
+        try:
+            # if os.path.exists("./dynagen_offload_dir"):
+            #     shutil.rmtree("./dynagen_offload_dir")
+            #     os.makedirs("./dynagen_offload_dir")
+            batch_size_split, num_batch = split_batch(batch_size)
+            print(f"Available GPU memory: {self.gpu_memory_available(batch_size):.2f} GB")
+            print("Splitting batch into batches:", batch_size_split, ", num_batch: ", num_batch)
+            self.model.update_policy(cache_gpu_percent, cache_cpu_percent, batch_size_split, num_batch)
+            self.model.update_weight(w_gpu_percent, w_cpu_percent)
+            actual_resident_partitions = self.update_resident_partitions(resident_partitions)
 
-            start_idx = i * batch_size
-            if start_idx >= len(self.questions):
-                break
+            timing_stats = {"query_times": [], "generation_times": [], "total_times": []}
 
-            batch = self.questions[start_idx : start_idx + batch_size]
-            query_texts = [q["question"] for q in batch]
-            query_embeddings = self.embedding_model.embed_documents(query_texts)
+            for i in range(num_test_batches):
+                if thread_exceptions:
+                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
+                    return {"error": "cpu_oom"}
 
-            query_start = time.time()
-            batch_results, _ = batch_query(
-                collection=self.collection,
-                questions=batch,
-                query_texts=query_texts,
-                query_embeddings=query_embeddings,
-                partition_names=self.partition_names,
-                resident_partitions=actual_resident_partitions,
-            )
-            query_time = time.time() - query_start
+                start_idx = i * batch_size
+                if start_idx >= len(self.questions):
+                    break
 
-            # Set timeout to 2x the previous generation time
-            timeout = self.prev_gen_time * 2  # Min 10s, max 300s
-            gen_start = time.time()
-            generation_result = batch_generate_responses(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                batch_results=batch_results,
-                max_new_tokens=16,
-                batch_size=batch_size,
-                env=self.env,
-            )
-            gen_time = time.time() - gen_start
-            cache_files = glob.glob("./dynagen_offload_dir/t_*")
-            for file_path in cache_files:
-                try:
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                except Exception as e:
-                    continue
-            print(f"delete {len(cache_files)} files on disk")
+                batch = self.questions[start_idx : start_idx + batch_size]
+                query_texts = [q["question"] for q in batch]
+                query_embeddings = self.embedding_model.embed_documents(query_texts)
 
-            responses, _ = generation_result
+                query_start = time.time()
+                batch_results, _ = batch_query(
+                    collection=self.collection,
+                    questions=batch,
+                    query_texts=query_texts,
+                    query_embeddings=query_embeddings,
+                    partition_names=self.partition_names,
+                    resident_partitions=actual_resident_partitions,
+                )
+                query_time = time.time() - query_start
 
-            # Update previous generation time for next batch
-            self.prev_gen_time = gen_time
+                if thread_exceptions:
+                    print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
+                    return {"error": "cpu_oom"}
 
-            timing_stats["query_times"].append(query_time)
-            timing_stats["generation_times"].append(gen_time)
-            timing_stats["total_times"].append(query_time + gen_time)
+                # Set timeout to 2x the previous generation time
+                timeout = self.prev_gen_time * 2  # Min 10s, max 300s
+                gen_start = time.time()
+                generation_result = batch_generate_responses(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    batch_results=batch_results,
+                    max_new_tokens=16,
+                    batch_size=batch_size,
+                    env=self.env,
+                )
+                gen_time = time.time() - gen_start
 
-        avg_query_time = np.mean(timing_stats["query_times"])
-        avg_gen_time = np.mean(timing_stats["generation_times"])
-        avg_total_time = np.mean(timing_stats["total_times"])
+                cache_files = glob.glob("./dynagen_offload_dir/t_*")
+                for file_path in cache_files:
+                    try:
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
 
-        memory_usage = self.get_memory_usage()
+                    except Exception as e:
+                        continue
+                print(f"delete {len(cache_files)} files on disk")
 
-        return {
-            "batch_size": batch_size,
-            "cache_gpu_percent": cache_gpu_percent,
-            "cache_cpu_percent": cache_cpu_percent,
-            "w_gpu_percent": w_gpu_percent,
-            "w_cpu_percent": w_cpu_percent,
-            "resident_partitions": actual_resident_partitions,
-            "avg_query_time": avg_query_time,
-            "avg_gen_time": avg_gen_time,
-            "avg_total_time": avg_total_time,
-            "memory_usage": memory_usage,
-            "success": True,
-        }
+                if generation_result[1] == "timeout":
+                    print(f"Generation timeout detected (>{timeout:.2f}s)")
+                    return {"error": "cpu_oom"}
+                elif "out of memory" in generation_result[1]:
+                    return {"error": "gpu_oom"}
+
+                responses, _ = generation_result
+
+                # Update previous generation time for next batch
+                self.prev_gen_time = gen_time
+
+                timing_stats["query_times"].append(query_time)
+                timing_stats["generation_times"].append(gen_time)
+                timing_stats["total_times"].append(query_time + gen_time)
+
+            if thread_exceptions:
+                print(f"Child thread OOM detected: {thread_exceptions[0].exc_value}")
+                return {"error": "cpu_oom"}
+
+            avg_query_time = np.mean(timing_stats["query_times"])
+            avg_gen_time = np.mean(timing_stats["generation_times"])
+            avg_total_time = np.mean(timing_stats["total_times"])
+
+            memory_usage = self.get_memory_usage()
+
+            return {
+                "batch_size": batch_size,
+                "cache_gpu_percent": cache_gpu_percent,
+                "cache_cpu_percent": cache_cpu_percent,
+                "w_gpu_percent": w_gpu_percent,
+                "w_cpu_percent": w_cpu_percent,
+                "resident_partitions": actual_resident_partitions,
+                "avg_query_time": avg_query_time,
+                "avg_gen_time": avg_gen_time,
+                "avg_total_time": avg_total_time,
+                "memory_usage": memory_usage,
+                "success": True,
+            }
+
+        except (RuntimeError, torch.cuda.OutOfMemoryError, OSError, Exception) as e:
+            error_msg = str(e)
+
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in error_msg:
+                print(f"GPU OOM detected: {error_msg}")
+                return {"error": "gpu_oom"}
+            elif (
+                "Cannot allocate memory" in error_msg
+                or "[Errno 12]" in error_msg
+                or "Resource temporarily unavailable" in error_msg
+                or "libgomp" in error_msg
+            ):
+                print(f"CPU OOM detected: {error_msg}")
+                return {"error": "cpu_oom"}
+            elif "Exception in thread" in error_msg and "Cannot allocate memory" in error_msg:
+                print(f"Thread-related CPU OOM detected: {error_msg}")
+                return {"error": "cpu_oom"}
+            else:
+                print(f"Other error detected: {error_msg}")
+                return {"error": "other", "message": error_msg}
+
+        finally:
+            threading.excepthook = sys.__excepthook__
 
     def calculate_memory_distribution(
         self, batch_size: int, available_gpu_memory: float, available_cpu_memory: float
@@ -338,7 +395,7 @@ class ActiveProfilingProcessor:
         weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
         cache_on_disk = (cache_on_disk_percent / 100) * cache_size
         total_on_disk = weight_on_disk + cache_on_disk
-        max_allowed_on_disk = 0.3 * (self.total_weight_gb + cache_size)
+        max_allowed_on_disk = max_disk_percent * (self.total_weight_gb + cache_size)
 
         if total_on_disk > max_allowed_on_disk:
             print(f"Warning: Disk storage constraint violated. Adjusting configuration.")
@@ -399,6 +456,78 @@ class ActiveProfilingProcessor:
 
         return distribution
 
+    def save_sample_to_file(self, batch_size: int, sample: Dict) -> None:
+        """Save a single configuration sample to a batch-specific file"""
+        os.makedirs(f"{self.model_name}_data", exist_ok=True)
+        batch_samples_file = f"{self.model_name}_data/batch_{batch_size}_samples.json"
+
+        # Convert numpy types to Python native types for JSON serialization
+        sample_copy = {}
+        for key, value in sample.items():
+            if isinstance(value, (np.integer, np.floating)):
+                sample_copy[key] = float(value)
+            elif isinstance(value, dict):
+                sample_copy[key] = {
+                    k: float(v) if isinstance(v, (np.integer, np.floating)) else v for k, v in value.items()
+                }
+            else:
+                sample_copy[key] = value
+
+        # Load existing samples if file exists
+        samples = []
+        if os.path.exists(batch_samples_file):
+            try:
+                with open(batch_samples_file, "r") as f:
+                    samples = json.load(f)
+            except Exception as e:
+                print(f"Error loading existing samples: {e}")
+                samples = []
+
+        # Add new sample and save
+        samples.append(sample_copy)
+        with open(batch_samples_file, "w") as f:
+            json.dump(samples, f, indent=4)
+
+        print(f"Saved sample to {batch_samples_file}")
+
+    def load_all_batch_samples(self) -> Dict[str, List]:
+        """Load all batch samples from previously saved files"""
+        batch_files = glob.glob(f"{self.model_name}_data/batch_*_samples.json")
+
+        # Initialize data structure
+        all_data = {
+            "batch_size": [],
+            "cache_gpu_percent": [],
+            "cache_cpu_percent": [],
+            "w_gpu_percent": [],
+            "w_cpu_percent": [],
+            "resident_partitions": [],
+            "inference_latency": [],
+            "query_latency": [],
+        }
+
+        # Load data from each batch file
+        for batch_file in batch_files:
+            try:
+                with open(batch_file, "r") as f:
+                    samples = json.load(f)
+
+                for sample in samples:
+                    if sample.get("success", False):
+                        all_data["batch_size"].append(sample["batch_size"])
+                        all_data["cache_gpu_percent"].append(sample["cache_gpu_percent"])
+                        all_data["cache_cpu_percent"].append(sample["cache_cpu_percent"])
+                        all_data["w_gpu_percent"].append(sample["w_gpu_percent"])
+                        all_data["w_cpu_percent"].append(sample["w_cpu_percent"])
+                        all_data["resident_partitions"].append(sample["resident_partitions"])
+                        all_data["inference_latency"].append(sample["avg_gen_time"])
+                        all_data["query_latency"].append(sample["avg_query_time"])
+            except Exception as e:
+                print(f"Error loading samples from {batch_file}: {e}")
+
+        print(f"Loaded {len(all_data['batch_size'])} samples from {len(batch_files)} batch files")
+        return all_data
+
     def find_optimal_config_with_model(
         self,
         batch_size: int,
@@ -408,153 +537,140 @@ class ActiveProfilingProcessor:
     ):
         """Find optimal configuration for a given batch size using linear programming approach"""
         if inf_model is None or query_model is None:
+            print("No prediction models available")
             return None
 
         # Check GPU memory capacity (after accounting for compute space)
         batch_size_split, _ = split_batch(batch_size)
-        if self.gpu_memory_available(batch_size) <= 0:
+        available_gpu_memory = self.gpu_memory_available(batch_size)
+        if available_gpu_memory <= 0:
             print(f"Batch size {batch_size} exceeds GPU compute space")
             return None
 
-        # Get the linear regression coefficients
-        inf_coef = inf_model.coef_
-        inf_intercept = inf_model.intercept_
-        query_coef = query_model.coef_
-        query_intercept = query_model.intercept_
+        print(f"Available GPU memory for batch size {batch_size}: {available_gpu_memory:.2f} GB")
 
-        # Define variables for linear programming
-        # x[0] = w_gpu_percent
-        # x[1] = w_cpu_percent
-        # x[2] = cache_gpu_percent
-        # x[3] = cache_cpu_percent
-        # x[4] = resident_partitions
-        # x[5] = maximum latency (we want to minimize this)
-
-        # Our objective is to minimize the maximum latency
-        c = [0, 0, 0, 0, 0, 1]
-
-        # Define constraints for the optimization problem
-
-        # Cache size in GB for the given batch size
-        cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
-
-        # Hidden state size in GB for the given batch size
-        hidden_size = self.estimate_hidden_size(batch_size)
-
-        # 1. Inference latency <= max_latency
-        # inf_latency = inf_coef[0]*w_gpu + inf_coef[1]*w_cpu + inf_coef[2]*cache_gpu*batch_size +
-        #               inf_coef[3]*cache_cpu*batch_size + inf_coef[4]*batch_size +
-        #               inf_coef[5]*log(batch_size) + inf_intercept <= max_latency
-        #
-        # Rearranged: inf_coef[0]*w_gpu + inf_coef[1]*w_cpu + inf_coef[2]*cache_gpu*batch_size +
-        #             inf_coef[3]*cache_cpu*batch_size - max_latency <= -inf_coef[4]*batch_size -
-        #             inf_coef[5]*log(batch_size) - inf_intercept
-        A_inf_latency = [
-            inf_coef[0],
-            inf_coef[1],
-            inf_coef[2] * batch_size,
-            inf_coef[3] * batch_size,
-            0,  # resident_partitions not used in inference model
-            -1,  # -max_latency
-        ]
-        b_inf_latency = -inf_coef[4] * batch_size - inf_coef[5] * math.log(batch_size) - inf_intercept
-
-        # 2. Query latency <= max_latency
-        # query_latency = query_coef[0]*resident_partitions + query_coef[1]*batch_size + query_intercept <= max_latency
-        # Rearranged: query_coef[0]*resident_partitions - max_latency <= -query_coef[1]*batch_size - query_intercept
-        A_query_latency = [0, 0, 0, 0, query_coef[0], -1]  # Only resident_partitions and max_latency
-        b_query_latency = -query_coef[1] * batch_size - query_intercept
-
-        # 3. Weight distribution constraint: w_gpu + w_cpu <= 100
-        A_weight_dist = [1, 1, 0, 0, 0, 0]
-        b_weight_dist = 100
-
-        # 4. Cache distribution constraint: cache_gpu + cache_cpu <= 100
-        A_cache_dist = [0, 0, 1, 1, 0, 0]
-        b_cache_dist = 100
-
-        # 5. GPU memory constraint: (w_gpu*self.total_weight_gb/100) + (cache_gpu*cache_size/100) + hidden_size <= gpu_available
-        gpu_available = self.gpu_memory_available(batch_size)
-        A_gpu_mem = [self.total_weight_gb / 100, 0, cache_size / 100, 0, 0, 0]
-        b_gpu_mem = gpu_available - hidden_size
-
-        # 6. CPU memory constraint: (w_cpu*self.total_weight_gb/100) + (cache_cpu*cache_size/100) +
-        #                          (resident_partitions*self.partition_size_gb) <= self.total_cpu_gb
-        A_cpu_mem = [0, self.total_weight_gb / 100, 0, cache_size / 100, self.partition_size_gb, 0]
-        b_cpu_mem = self.total_cpu_gb
-
-        # 7. NEW CONSTRAINT: cache_gpu_percent + cache_cpu_percent >= 20
-        # Rearranged: -cache_gpu_percent - cache_cpu_percent <= -20
-        A_cache_min = [0, 0, -1, -1, 0, 0]
-        b_cache_min = -40
-
-        # 8. NEW CONSTRAINT: w_gpu_percent + w_cpu_percent >= 20
-        # Rearranged: -w_gpu_percent - w_cpu_percent <= -20
-        A_weight_min = [-1, -1, 0, 0, 0, 0]
-        b_weight_min = -40
-
-        # 9. NEW CONSTRAINT: Weight and cache on disk <= 50% of total weight and cache
-        # Disk weight = (100 - w_gpu - w_cpu) * total_weight_gb / 100
-        # Disk cache = (100 - cache_gpu - cache_cpu) * cache_size / 100
-        # Constraint: Disk weight + Disk cache <= 0.5 * (total_weight_gb + cache_size)
-        # Expanded: (100 - w_gpu - w_cpu) * total_weight_gb / 100 + (100 - cache_gpu - cache_cpu) * cache_size / 100 <= 0.5 * (total_weight_gb + cache_size)
-        # Simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <=
-        #             0.5 * (total_weight_gb + cache_size) - total_weight_gb - cache_size
-        # Further simplified: -w_gpu * total_weight_gb/100 - w_cpu * total_weight_gb/100 - cache_gpu * cache_size/100 - cache_cpu * cache_size/100 <=
-        #                     -0.5 * (total_weight_gb + cache_size)
-        A_disk_limit = [
-            -self.total_weight_gb / 100,  # w_gpu_percent coefficient
-            -self.total_weight_gb / 100,  # w_cpu_percent coefficient
-            -cache_size / 100,  # cache_gpu_percent coefficient
-            -cache_size / 100,  # cache_cpu_percent coefficient
-            0,  # resident_partitions coefficient
-            0,  # max_latency coefficient
-        ]
-        b_disk_limit = -0.3 * (self.total_weight_gb + cache_size)
-
-        # Combine all constraints
-        A_ub = np.array(
-            [
-                A_inf_latency,
-                A_query_latency,
-                A_weight_dist,
-                A_cache_dist,
-                A_gpu_mem,
-                A_cpu_mem,
-                A_cache_min,
-                A_weight_min,
-                A_disk_limit,  # Added the new disk storage constraint
-            ]
-        )
-        b_ub = np.array(
-            [
-                b_inf_latency,
-                b_query_latency,
-                b_weight_dist,
-                b_cache_dist,
-                b_gpu_mem,
-                b_cpu_mem,
-                b_cache_min,
-                b_weight_min,
-                b_disk_limit,  # Added the new disk storage constraint limit
-            ]
-        )
-
-        # Variable bounds
-        # w_gpu_percent, w_cpu_percent, cache_gpu_percent, cache_cpu_percent >= 0
-        # resident_partitions >= 0 and <= len(self.partition_names)
-        # max_latency >= 0
-        bounds = [
-            (0, 100),  # w_gpu_percent
-            (0, 100),  # w_cpu_percent
-            (0, 100),  # cache_gpu_percent
-            (0, 100),  # cache_cpu_percent
-            (0, len(self.partition_names)),  # resident_partitions
-            (0, None),  # max_latency (no upper bound)
-        ]
-
-        # Solve the linear programming problem
         try:
+            # Get the linear regression coefficients
+            inf_coef = inf_model.coef_
+            inf_intercept = inf_model.intercept_
+            query_coef = query_model.coef_
+            query_intercept = query_model.intercept_
+
+            # Define variables for linear programming
+            # x[0] = w_gpu_percent
+            # x[1] = w_cpu_percent
+            # x[2] = cache_gpu_percent
+            # x[3] = cache_cpu_percent
+            # x[4] = resident_partitions
+            # x[5] = maximum latency (we want to minimize this)
+
+            # Our objective is to minimize the maximum latency
+            c = [0, 0, 0, 0, 0, 1]
+
+            # Define constraints for the optimization problem
+
+            # Cache size in GB for the given batch size
+            cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
+            print(f"Cache size for batch {batch_size}: {cache_size:.2f} GB")
+
+            # Hidden state size in GB for the given batch size
+            hidden_size = self.estimate_hidden_size(batch_size)
+
+            # 1. Inference latency <= max_latency
+            A_inf_latency = [
+                inf_coef[0],
+                inf_coef[1],
+                inf_coef[2] * batch_size,
+                inf_coef[3] * batch_size,
+                0,  # resident_partitions not used in inference model
+                -1,  # -max_latency
+            ]
+            b_inf_latency = -inf_coef[4] * batch_size - inf_coef[5] * math.log(batch_size) - inf_intercept
+
+            # 2. Query latency <= max_latency
+            A_query_latency = [0, 0, 0, 0, query_coef[0], -1]  # Only resident_partitions and max_latency
+            b_query_latency = -query_coef[1] * batch_size - query_intercept
+
+            # 3. Weight distribution constraint: w_gpu + w_cpu <= 100
+            A_weight_dist = [1, 1, 0, 0, 0, 0]
+            b_weight_dist = 100
+
+            # 4. Cache distribution constraint: cache_gpu + cache_cpu <= 100
+            A_cache_dist = [0, 0, 1, 1, 0, 0]
+            b_cache_dist = 100
+
+            # 5. GPU memory constraint: (w_gpu*self.total_weight_gb/100) + (cache_gpu*cache_size/100) + hidden_size <= gpu_available
+            A_gpu_mem = [self.total_weight_gb / 100, 0, cache_size / 100, 0, 0, 0]
+            b_gpu_mem = available_gpu_memory - hidden_size
+
+            # Make this constraint a bit more relaxed to avoid infeasibility
+            safety_margin = 0.9  # Use 90% of available GPU memory
+            b_gpu_mem *= safety_margin
+
+            # 6. CPU memory constraint: (w_cpu*self.total_weight_gb/100) + (cache_cpu*cache_size/100) +
+            #                          (resident_partitions*self.partition_size_gb) <= self.total_cpu_gb
+            A_cpu_mem = [0, self.total_weight_gb / 100, 0, cache_size / 100, self.partition_size_gb, 0]
+            b_cpu_mem = self.total_cpu_gb * 0.95  # Use 95% of available CPU memory
+
+            # 7. Minimum cache constraint: cache_gpu_percent + cache_cpu_percent >= min_percentage
+            min_cache_percentage = (1 - max_disk_percent) * 100
+            A_cache_min = [0, 0, -1, -1, 0, 0]
+            b_cache_min = -min_cache_percentage
+
+            # 8. Minimum weight constraint: w_gpu_percent + w_cpu_percent >= min_percentage
+            A_weight_min = [-1, -1, 0, 0, 0, 0]
+            b_weight_min = -min_cache_percentage
+
+            # 9. Disk storage constraint
+            A_disk_limit = [
+                -self.total_weight_gb / 100,
+                -self.total_weight_gb / 100,
+                -cache_size / 100,
+                -cache_size / 100,
+                0,
+                0,
+            ]
+            b_disk_limit = -max_disk_percent * (self.total_weight_gb + cache_size)
+
+            # Combine all constraints
+            A_ub = np.array(
+                [
+                    A_inf_latency,
+                    A_query_latency,
+                    A_weight_dist,
+                    A_cache_dist,
+                    A_gpu_mem,
+                    A_cpu_mem,
+                    A_cache_min,
+                    A_weight_min,
+                    A_disk_limit,
+                ]
+            )
+            b_ub = np.array(
+                [
+                    b_inf_latency,
+                    b_query_latency,
+                    b_weight_dist,
+                    b_cache_dist,
+                    b_gpu_mem,
+                    b_cpu_mem,
+                    b_cache_min,
+                    b_weight_min,
+                    b_disk_limit,
+                ]
+            )
+
+            # Variable bounds
+            bounds = [
+                (0, 100),  # w_gpu_percent
+                (0, 100),  # w_cpu_percent
+                (0, 100),  # cache_gpu_percent
+                (0, 100),  # cache_cpu_percent
+                (0, len(self.partition_names)),  # resident_partitions
+                (0, None),  # max_latency (no upper bound)
+            ]
+
+            # Solve the linear programming problem
             result = linprog(c=c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
 
             if result.success:
@@ -566,51 +682,36 @@ class ActiveProfilingProcessor:
                 resident_partitions = round(result.x[4])
                 max_latency = result.x[5]
 
-                # Double-check the disk storage constraint is satisfied
+                # Verify disk storage constraint
                 weight_on_disk_percent = 100 - w_gpu_percent - w_cpu_percent
                 cache_on_disk_percent = 100 - cache_gpu_percent - cache_cpu_percent
                 weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
                 cache_on_disk = (cache_on_disk_percent / 100) * cache_size
                 total_on_disk = weight_on_disk + cache_on_disk
-                max_allowed_on_disk = 0.5 * (self.total_weight_gb + cache_size)
+                max_allowed_on_disk = max_disk_percent * (self.total_weight_gb + cache_size)
 
-                if total_on_disk > max_allowed_on_disk + 0.1:  # Add small tolerance for floating point errors
-                    print(
-                        f"Warning: Disk storage constraint violated. Total on disk: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB"
-                    )
-                    # Adjust the solution to meet the constraint
-                    # This is a simplistic approach - we could use a more sophisticated method if needed
-                    if weight_on_disk > 0:
-                        additional_weight_needed = min(
+                if total_on_disk > max_allowed_on_disk + 0.1:
+                    print(f"Warning: Disk constraint violated. Adjusting solution.")
+                    print(f"Disk usage: {total_on_disk:.2f} GB, Max allowed: {max_allowed_on_disk:.2f} GB")
+
+                    # Simple adjustment: move more to CPU if possible
+                    if weight_on_disk > 0 and w_cpu_percent < 100:
+                        adjust_amount = min(
                             weight_on_disk_percent,
                             round((total_on_disk - max_allowed_on_disk) / self.total_weight_gb * 100),
                         )
-                        # First try to put more weight on CPU
-                        if w_cpu_percent + additional_weight_needed <= 100:
-                            w_cpu_percent += additional_weight_needed
-                        # If that's not enough, try GPU
-                        else:
-                            remaining = additional_weight_needed - (100 - w_cpu_percent)
-                            w_cpu_percent = 100
-                            w_gpu_percent += remaining
+                        w_cpu_percent = min(100, w_cpu_percent + adjust_amount)
 
-                    # If we still haven't met the constraint, adjust cache percentages
                     weight_on_disk_percent = 100 - w_gpu_percent - w_cpu_percent
                     weight_on_disk = (weight_on_disk_percent / 100) * self.total_weight_gb
                     total_on_disk = weight_on_disk + cache_on_disk
 
-                    if total_on_disk > max_allowed_on_disk + 0.1 and cache_on_disk > 0:
-                        additional_cache_needed = min(
+                    # If still exceeding, adjust cache
+                    if total_on_disk > max_allowed_on_disk + 0.1 and cache_on_disk > 0 and cache_cpu_percent < 100:
+                        adjust_amount = min(
                             cache_on_disk_percent, round((total_on_disk - max_allowed_on_disk) / cache_size * 100)
                         )
-                        # First try to put more cache on CPU
-                        if cache_cpu_percent + additional_cache_needed <= 100:
-                            cache_cpu_percent += additional_cache_needed
-                        # If that's not enough, try GPU
-                        else:
-                            remaining = additional_cache_needed - (100 - cache_cpu_percent)
-                            cache_cpu_percent = 100
-                            cache_gpu_percent += remaining
+                        cache_cpu_percent = min(100, cache_cpu_percent + adjust_amount)
 
                 # Predict latencies using the optimized configuration
                 X_inf = np.array(
@@ -631,7 +732,7 @@ class ActiveProfilingProcessor:
                 predicted_inf_latency = inf_model.predict(X_inf)[0]
                 predicted_query_latency = query_model.predict(X_query)[0]
 
-                best_config = {
+                return {
                     "batch_size": int(batch_size),
                     "cache_gpu_percent": int(cache_gpu_percent),
                     "cache_cpu_percent": int(cache_cpu_percent),
@@ -642,107 +743,65 @@ class ActiveProfilingProcessor:
                     "predicted_query_latency": float(predicted_query_latency),
                     "max_latency": float(max_latency),
                 }
-
-                os.makedirs(f"{self.model_name}_data", exist_ok=True)
-
-                # Save the optimal configuration for this batch size
-                config_file = f"{self.model_name}_data/optimal_config_batch{batch_size}.json"
-                all_configs_file = f"{self.model_name}_data/all_optimal_configs.json"
-
-                with open(config_file, "w") as f:
-                    json.dump(best_config, f, indent=4)
-
-                # Update the record of all optimal configurations
-                all_configs = []
-                if os.path.exists(all_configs_file):
-                    with open(all_configs_file, "r") as f:
-                        try:
-                            all_configs = json.load(f)
-                        except:
-                            all_configs = []
-
-                # Check if a configuration for this batch size already exists
-                exists = False
-                for i, config in enumerate(all_configs):
-                    if config.get("batch_size") == batch_size:
-                        all_configs[i] = best_config
-                        exists = True
-                        break
-
-                if not exists:
-                    all_configs.append(best_config)
-
-                # Sort configurations by batch size
-                all_configs.sort(key=lambda x: x.get("batch_size", 0))
-
-                with open(all_configs_file, "w") as f:
-                    json.dump(all_configs, f, indent=4)
-
-                print(f"Saved optimal configuration for batch size {batch_size} to {config_file}")
-
-                return best_config
             else:
                 print(f"Optimization failed: {result.message}")
-                return None
+                print("Using fallback memory distribution method")
+
         except Exception as e:
-            print(f"Error in optimization: {e}")
+            print(f"Error in optimization: {str(e)}")
+            print("Using fallback memory distribution method")
 
-            # Fallback to a simple feasible solution if optimization fails
-            print("Falling back to default configuration...")
+        # Fallback: Use the calculate_memory_distribution method
+        print("Computing fallback configuration...")
+        distribution = self.calculate_memory_distribution(batch_size, available_gpu_memory, self.total_cpu_gb)
 
-            # Calculate a basic memory distribution
-            distribution = self.calculate_memory_distribution(
-                batch_size, self.gpu_memory_available(batch_size), self.total_cpu_gb
-            )
+        # Print the fallback configuration for debugging
+        print("Fallback configuration:")
+        print(f"- w_gpu_percent: {distribution['w_gpu_percent']}")
+        print(f"- w_cpu_percent: {distribution['w_cpu_percent']}")
+        print(f"- cache_gpu_percent: {distribution['cache_gpu_percent']}")
+        print(f"- cache_cpu_percent: {distribution['cache_cpu_percent']}")
+        print(f"- resident_partitions: {distribution['resident_partitions']}")
 
-            # Create a fallback configuration
-            X_inf = np.array(
+        # Predict performance using the fallback configuration
+        X_inf = np.array(
+            [
                 [
-                    [
-                        distribution["w_gpu_percent"],
-                        distribution["w_cpu_percent"],
-                        distribution["cache_gpu_percent"] * batch_size,
-                        distribution["cache_cpu_percent"] * batch_size,
-                        batch_size,
-                        math.log(batch_size),
-                    ]
+                    distribution["w_gpu_percent"],
+                    distribution["w_cpu_percent"],
+                    distribution["cache_gpu_percent"] * batch_size,
+                    distribution["cache_cpu_percent"] * batch_size,
+                    batch_size,
+                    math.log(batch_size),
                 ]
-            )
+            ]
+        )
 
-            X_query = np.array([[distribution["resident_partitions"], batch_size]])
+        X_query = np.array([[distribution["resident_partitions"], batch_size]])
 
-            predicted_inf_latency = inf_model.predict(X_inf)[0]
-            predicted_query_latency = query_model.predict(X_query)[0]
+        predicted_inf_latency = inf_model.predict(X_inf)[0]
+        predicted_query_latency = query_model.predict(X_query)[0]
 
-            return {
-                "batch_size": int(batch_size),
-                "cache_gpu_percent": int(distribution["cache_gpu_percent"]),
-                "cache_cpu_percent": int(distribution["cache_cpu_percent"]),
-                "w_gpu_percent": int(distribution["w_gpu_percent"]),
-                "w_cpu_percent": int(distribution["w_cpu_percent"]),
-                "resident_partitions": int(distribution["resident_partitions"]),
-                "predicted_inf_latency": float(predicted_inf_latency),
-                "predicted_query_latency": float(predicted_query_latency),
-                "max_latency": max(predicted_inf_latency, predicted_query_latency),
-            }
+        return {
+            "batch_size": int(batch_size),
+            "cache_gpu_percent": int(distribution["cache_gpu_percent"]),
+            "cache_cpu_percent": int(distribution["cache_cpu_percent"]),
+            "w_gpu_percent": int(distribution["w_gpu_percent"]),
+            "w_cpu_percent": int(distribution["w_cpu_percent"]),
+            "resident_partitions": int(distribution["resident_partitions"]),
+            "predicted_inf_latency": float(predicted_inf_latency),
+            "predicted_query_latency": float(predicted_query_latency),
+            "max_latency": max(predicted_inf_latency, predicted_query_latency),
+        }
 
     def find_optimal_config(self) -> List[Dict]:
         """Find optimal configuration through profiling with learning-based approach"""
-        batch_sizes = [64, 96, 128, 160, 192, 224, 256]
+        batch_sizes = [160, 192, 224]
         optimal_configs = []
         prev_best_max_time = float("inf")
 
-        # Store training data for the learning model
-        training_data = {
-            "batch_size": [],
-            "cache_gpu_percent": [],
-            "cache_cpu_percent": [],
-            "w_gpu_percent": [],
-            "w_cpu_percent": [],
-            "resident_partitions": [],
-            "inference_latency": [],
-            "query_latency": [],
-        }
+        # Ensure data directory exists
+        os.makedirs(f"{self.model_name}_data", exist_ok=True)
 
         # Cost models for latency prediction
         inf_model, query_model = None, None
@@ -766,19 +825,11 @@ class ActiveProfilingProcessor:
             retries = 0
             max_retries = 10
 
-            # Try getting an optimized config from the model if we have enough data
-            if len(training_data["batch_size"]) >= learning_samples:
+            # Try getting an optimized config from the model if we have enough samples
+            all_training_data = self.load_all_batch_samples()
+            if len(all_training_data["batch_size"]) >= learning_samples:
                 # Train the cost models
-                inf_model, query_model = self.learning_cost_model(
-                    training_data["batch_size"],
-                    training_data["cache_gpu_percent"],
-                    training_data["cache_cpu_percent"],
-                    training_data["w_gpu_percent"],
-                    training_data["w_cpu_percent"],
-                    training_data["resident_partitions"],
-                    training_data["inference_latency"],
-                    training_data["query_latency"],
-                )
+                inf_model, query_model = self.learning_cost_model(all_training_data)
 
                 # Get model-based prediction for this batch size
                 predicted_config = self.find_optimal_config_with_model(batch_size, inf_model, query_model)
@@ -811,15 +862,8 @@ class ActiveProfilingProcessor:
                             best_max_time = max_time
                             best_config = result
 
-                        # Add to training data
-                        training_data["batch_size"].append(batch_size)
-                        training_data["cache_gpu_percent"].append(result["cache_gpu_percent"])
-                        training_data["cache_cpu_percent"].append(result["cache_cpu_percent"])
-                        training_data["w_gpu_percent"].append(result["w_gpu_percent"])
-                        training_data["w_cpu_percent"].append(result["w_cpu_percent"])
-                        training_data["resident_partitions"].append(result["resident_partitions"])
-                        training_data["inference_latency"].append(result["avg_gen_time"])
-                        training_data["query_latency"].append(result["avg_query_time"])
+                        # Save sample to batch-specific file
+                        self.save_sample_to_file(batch_size, result)
 
                         # Initialize configurations_tried for tracking already tested configs
                         configurations_tried = set()
@@ -873,15 +917,8 @@ class ActiveProfilingProcessor:
                 result = self.try_configuration(batch_size=batch_size, **distribution)
 
                 if result.get("success", False):
-                    # Add to training data
-                    training_data["batch_size"].append(batch_size)
-                    training_data["cache_gpu_percent"].append(result["cache_gpu_percent"])
-                    training_data["cache_cpu_percent"].append(result["cache_cpu_percent"])
-                    training_data["w_gpu_percent"].append(result["w_gpu_percent"])
-                    training_data["w_cpu_percent"].append(result["w_cpu_percent"])
-                    training_data["resident_partitions"].append(result["resident_partitions"])
-                    training_data["inference_latency"].append(result["avg_gen_time"])
-                    training_data["query_latency"].append(result["avg_query_time"])
+                    # Save sample to batch-specific file
+                    self.save_sample_to_file(batch_size, result)
 
                     max_time = max(result["avg_gen_time"], result["avg_query_time"])
                     time_diff_percent = (
@@ -944,6 +981,86 @@ class ActiveProfilingProcessor:
                                 distribution["resident_partitions"] += 1
                     else:
                         break
+                else:
+                    error_type = result.get("error")
+                    cache_size = self.estimate_cache_size(batch_size, self.model_config.num_hidden_layers)
+                    available_gpu_memory = (
+                        self.gpu_memory_available(batch_size)
+                        - distribution["cache_gpu_percent"] * cache_size / 10
+                        - distribution["w_gpu_percent"] * self.total_weight_gb / 100
+                    )
+                    if error_type == "gpu_oom" and available_gpu_memory < 0.3 * self.gpu_memory_gb:
+                        print("GPU memory exhausted, retrying with reduced tensors")
+                        # Calculate available CPU memory
+                        used_cpu_memory = (
+                            (self.total_weight_gb * distribution["w_cpu_percent"] / 100)
+                            + (cache_size * distribution["cache_cpu_percent"] / 100)
+                            + (distribution["resident_partitions"] * self.partition_size_gb)
+                        )
+                        available_cpu_memory = self.total_cpu_gb - used_cpu_memory
+
+                        # Then try to move cache from GPU first
+                        remove_gpu_tensor_gb = 2
+                        remove_cpu_tensor_gb = 5
+                        if distribution["cache_gpu_percent"] * cache_size / 100 > remove_gpu_tensor_gb:
+                            reduction = int(remove_gpu_tensor_gb / cache_size * 100)
+                            distribution["cache_gpu_percent"] -= reduction
+
+                            # Calculate how much can fit in CPU
+                            if available_cpu_memory >= remove_gpu_tensor_gb:
+                                # Can fit in CPU
+                                distribution["cache_cpu_percent"] += reduction
+                                available_cpu_memory -= remove_gpu_tensor_gb
+                            else:
+                                # Can only fit part in CPU, rest goes to disk
+                                cpu_possible_percent = int((available_cpu_memory / cache_size) * 100)
+                                distribution["cache_cpu_percent"] += cpu_possible_percent
+                                # Rest implicitly goes to disk
+                                available_cpu_memory = 0
+
+                        # Try to move weights if needed
+                        elif distribution["w_gpu_percent"] * self.total_weight_gb / 100 > remove_cpu_tensor_gb:
+                            reduction = int(remove_cpu_tensor_gb / self.total_weight_gb * 100)
+                            distribution["w_gpu_percent"] -= reduction
+
+                            # Calculate how much can fit in CPU
+                            if available_cpu_memory >= remove_cpu_tensor_gb:
+                                # Can fit in CPU
+                                distribution["w_cpu_percent"] += reduction
+                                available_cpu_memory -= remove_cpu_tensor_gb
+                            else:
+                                # Can only fit part in CPU, rest goes to disk
+                                cpu_possible_percent = int((available_cpu_memory / self.total_weight_gb) * 100)
+                                distribution["w_cpu_percent"] += cpu_possible_percent
+                                # Rest implicitly goes to disk
+                                available_cpu_memory = 0
+                        else:
+                            break
+                    else:
+                        print("CPU memory exhausted, retrying with reduced tensors and partitions")
+                        # Reduce CPU usage
+                        if best_config and best_config["avg_query_time"] < best_config["avg_gen_time"]:
+                            if distribution["resident_partitions"] > 0:
+                                distribution["resident_partitions"] -= 1
+                            elif distribution["cache_cpu_percent"] * cache_size / 100 > 10:
+                                reduction = int(10 / cache_size * 100)
+                                distribution["cache_cpu_percent"] -= reduction
+                            elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
+                                reduction = int(10 / self.total_weight_gb * 100)
+                                distribution["w_cpu_percent"] -= reduction
+                            else:
+                                break
+                        else:
+                            if distribution["cache_cpu_percent"] * cache_size / 100 > 10:
+                                reduction = int(10 / cache_size * 100)
+                                distribution["cache_cpu_percent"] -= reduction
+                            elif distribution["w_cpu_percent"] * self.total_weight_gb / 100 > 10:
+                                reduction = int(10 / self.total_weight_gb * 100)
+                                distribution["w_cpu_percent"] -= reduction
+                            elif distribution["resident_partitions"] > 0:
+                                distribution["resident_partitions"] -= 1
+                            else:
+                                break
 
                 retries += 1
 
@@ -969,18 +1086,8 @@ class ActiveProfilingProcessor:
 
         return optimal_configs
 
-    def learning_cost_model(
-        self,
-        batch_size: List[int],
-        cache_gpu_percent: List[int],
-        cache_cpu_percent: List[int],
-        w_gpu_percent: List[int],
-        w_cpu_percent: List[int],
-        resident_partitions: List[int],
-        inference_latency: List[float],
-        query_latency: List[float],
-    ):
-        """Build a cost model to predict inference and query latencies based on configuration parameters"""
+    def learning_cost_model(self, training_data):
+        """Build a cost model to predict inference and query latencies based on loaded samples"""
         import numpy as np
         from sklearn.linear_model import LinearRegression
         import json
@@ -993,22 +1100,28 @@ class ActiveProfilingProcessor:
         # d * cache_cpu_percent * batch_size + e * batch_size + f * log(batch_size) + g
         X_inf = np.column_stack(
             [
-                w_gpu_percent,
-                w_cpu_percent,
-                [cache_gpu_percent[i] * batch_size[i] for i in range(len(batch_size))],
-                [cache_cpu_percent[i] * batch_size[i] for i in range(len(batch_size))],
-                batch_size,
-                [math.log(bs) if bs > 0 else 0 for bs in batch_size],
+                training_data["w_gpu_percent"],
+                training_data["w_cpu_percent"],
+                [
+                    training_data["cache_gpu_percent"][i] * training_data["batch_size"][i]
+                    for i in range(len(training_data["batch_size"]))
+                ],
+                [
+                    training_data["cache_cpu_percent"][i] * training_data["batch_size"][i]
+                    for i in range(len(training_data["batch_size"]))
+                ],
+                training_data["batch_size"],
+                [math.log(bs) if bs > 0 else 0 for bs in training_data["batch_size"]],
             ]
         )
 
         # 查询延迟模型的特征：根据注释中的公式
         # a * resident_partitions + b * batch_size + c
-        X_query = np.column_stack([resident_partitions, batch_size])
+        X_query = np.column_stack([training_data["resident_partitions"], training_data["batch_size"]])
 
         # 创建目标向量
-        y_inf = np.array(inference_latency)
-        y_query = np.array(query_latency)
+        y_inf = np.array(training_data["inference_latency"])
+        y_query = np.array(training_data["query_latency"])
 
         # 训练推理延迟模型
         inf_model = LinearRegression()
@@ -1028,7 +1141,7 @@ class ActiveProfilingProcessor:
         print(f"推理模型MSE: {inf_mse:.4f}")
         print(f"查询模型MSE: {query_mse:.4f}")
 
-        # 保存模型参数和数据到人类可读的文件
+        # 保存模型参数到人类可读的文件
         os.makedirs(f"{self.model_name}_data", exist_ok=True)
 
         # 保存推理模型参数
@@ -1072,50 +1185,6 @@ class ActiveProfilingProcessor:
         with open(f"{self.model_name}_data/query_model_params.json", "w") as f:
             json.dump(query_model_params, f, indent=4)
 
-        # 保存训练数据
-        training_data = {
-            "batch_size": batch_size,
-            "cache_gpu_percent": cache_gpu_percent,
-            "cache_cpu_percent": cache_cpu_percent,
-            "w_gpu_percent": w_gpu_percent,
-            "w_cpu_percent": w_cpu_percent,
-            "resident_partitions": resident_partitions,
-            "inference_latency": inference_latency,
-            "query_latency": query_latency,
-        }
-
-        # 转换列表为JSON可序列化格式
-        for key in training_data:
-            training_data[key] = [
-                float(x) if isinstance(x, (np.integer, np.floating)) else x for x in training_data[key]
-            ]
-
-        with open(f"{self.model_name}_data/training_data.json", "w") as f:
-            json.dump(training_data, f, indent=4)
-
-        # 保存完整的训练样本供可视化和分析
-        samples = []
-        for i in range(len(batch_size)):
-            samples.append(
-                {
-                    "batch_size": batch_size[i],
-                    "cache_gpu_percent": cache_gpu_percent[i],
-                    "cache_cpu_percent": cache_cpu_percent[i],
-                    "w_gpu_percent": w_gpu_percent[i],
-                    "w_cpu_percent": w_cpu_percent[i],
-                    "resident_partitions": resident_partitions[i],
-                    "inference_latency": float(inference_latency[i]),
-                    "query_latency": float(query_latency[i]),
-                    "inference_predicted": float(inf_pred[i]),
-                    "query_predicted": float(query_pred[i]),
-                    "inference_error": float(inf_pred[i] - inference_latency[i]),
-                    "query_error": float(query_pred[i] - query_latency[i]),
-                }
-            )
-
-        with open(f"{self.model_name}_data/training_samples.json", "w") as f:
-            json.dump(samples, f, indent=4)
-
         return inf_model, query_model
 
     def run(self):
@@ -1143,5 +1212,4 @@ class ActiveProfilingProcessor:
             print(f"  - CPU: {config['memory_usage']['cpu_used']:.2f} GB")
             print(f"  - GPU: {config['memory_usage']['gpu_used']:.2f} GB")
 
-        self.env.close_copy_threads()
         return optimal_configs
