@@ -1,15 +1,15 @@
-from typing import List, Dict, Optional, Any
+from typing import List, Dict
 import time
 import torch
 import numpy as np
 from tqdm import tqdm
-from utils import Question, log_timing, batch_query
-from vllm import LLM, SamplingParams
+from utils import Question, log_timing, batch_query, batch_generate_responses
+from transformers import AutoModelForCausalLM
 
 
-class VLLMProcessor:
+class AccelerateProcessor:
     """
-    Sequential Processor that uses VLLM for generation.
+    Sequential Processor that uses HuggingFace models for generation.
     Queries are processed in batches, with each batch fully completing (query + generation)
     before the next batch starts. Batch size is dynamically adjusted based on interval arrival rate.
     """
@@ -21,29 +21,39 @@ class VLLMProcessor:
         arrival_rates: List[float],  # questions per minute (multiple rates)
         rate_change_interval: int,  # interval time (seconds)
         embedding_model,
-        model_name: str,  # Model name for VLLM initialization
+        model_name: str,
         tokenizer,
         collection,
         partition_names: List[str],
         timing_stats: Dict[str, List[float]],
+        gpu_memory_gb: int,
         resident_partitions: int = 0,
         base_time: float = None,
-        max_new_tokens: int = 16,
-        total_cpu_gb: int = 166,
-        gpu_memory_gb: int = 12,
-        gpu_memory_utilization: float = 0.5,
-        partition_size_gb: int = 10,
+        max_new_tokens: int = 32,
         seed: int = 42,
-        vllm_batch_size: Optional[int] = None,  # Max concurrent requests for VLLM'
+        dynagen: bool = False,
+        env=None,
     ):
         self.questions = [
             Question(question_text=q["question"], doc_id=q["doc_id"], arrival_time=0.0) for q in questions
         ]
-        self.max_batch_size = 64  # Renamed to max_batch_size
+        self.max_batch_size = batch_size  # Renamed to max_batch_size
         self.arrival_rates = arrival_rates if arrival_rates else [16]  # Default single arrival rate
         self.rate_change_interval = rate_change_interval
         self.embedding_model = embedding_model
         self.model_name = model_name
+
+        # Calculate memory requirements
+        max_memory_per_batch = 0.5  # GiB per batch
+        max_gpu_memory_size = gpu_memory_gb - (self.max_batch_size * max_memory_per_batch)
+
+        # Initialize model
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            max_memory={0: f"{max_gpu_memory_size}GiB"},
+        )
+
         self.tokenizer = tokenizer
         self.collection = collection
         self.partition_names = partition_names
@@ -52,45 +62,19 @@ class VLLMProcessor:
         self.base_time = base_time if base_time else time.time()
         self.results = []
         self.max_new_tokens = max_new_tokens
-        self.gpu_memory_utilization = gpu_memory_utilization
-        self.vllm_batch_size = vllm_batch_size if vllm_batch_size else batch_size
-        self.total_cpu_gb = total_cpu_gb - (resident_partitions + 1) * partition_size_gb
-        self.gpu_memory_gb = gpu_memory_gb
+
+        # Add dynagen and env attributes if they exist in the original implementation
+        self.dynagen = dynagen
+        self.env = env
 
         # New interval tracking variables
         self.interval_question_count = []
         self.interval_completion_count = []
 
-        # VLLM related attributes
-        self.vllm_model = None
-        self.sampling_params = SamplingParams(
-            temperature=0.0, max_tokens=max_new_tokens, stop=None  # Deterministic generation
-        )
-
         np.random.seed(seed)
 
         # Generate arrival times
         self._generate_arrival_times()
-
-        # Initialize VLLM model
-        self._init_vllm_model()
-
-    def _init_vllm_model(self):
-        """Initialize the VLLM model"""
-        print(f"\nInitializing VLLM model: {self.model_name}")
-        try:
-            self.vllm_model = LLM(
-                model=self.model_name,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                tensor_parallel_size=1,  # Adjust if using multiple GPUs
-                trust_remote_code=True,
-                cpu_offload_gb=self.total_cpu_gb,
-                max_model_len=512 + 16,
-            )
-            print("VLLM model initialized successfully")
-        except Exception as e:
-            print(f"Error initializing VLLM model: {e}")
-            raise
 
     def _generate_arrival_times(self):
         """Generate arrival times based on time-varying arrival rates"""
@@ -252,10 +236,10 @@ class VLLMProcessor:
         print(f"Starting generation for batch of {len(batch)} questions")
         generation_start_time = time.time()
 
+        # Prepare all inputs for generation
         prompts = []
         metadata_list = []
 
-        # Prepare all prompts and metadata
         for question, result in zip(batch, batch_results):
             context = result.get("answer", "")
             query = question.question_text
@@ -272,36 +256,35 @@ class VLLMProcessor:
                 }
             )
 
-        # Generate all outputs at once using VLLM
-        outputs = self.vllm_model.generate(prompts, self.sampling_params)
+        # Use batch_generate_responses for actual generation
+        batch_responses, updated_timing_stats = batch_generate_responses(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            batch_results=batch_results,
+            max_new_tokens=self.max_new_tokens,
+            batch_size=len(batch),
+            timing_stats=self.timing_stats,
+            dynagen=self.dynagen,
+            env=self.env if self.dynagen else None,
+        )
+        torch.cuda.empty_cache()
+        self.timing_stats.update(updated_timing_stats)
 
-        # Process results
-        for output, metadata in zip(outputs, metadata_list):
+        # Process results similar to VLLMProcessor
+        for output, metadata in zip(batch_responses, metadata_list):
             question = metadata["question"]
             result = metadata["result"]
-            full_prompt = metadata["prompt"]
-            generation_start_time = metadata["generation_start_time"]
-
             # Add generation time to timing stats
-            generation_time = time.time() - generation_start_time
+            generation_time = time.time() - metadata["generation_start_time"]
             log_timing(self.timing_stats, "generation_time", generation_time)
-
-            # Get the model's output
-            model_output = output.outputs[0].text.strip()
-
-            # Combine prompt and response as the complete response
-            complete_response = f"{full_prompt} {model_output}"
-
-            # Store this as the llm_response
-            result["llm_response"] = complete_response
 
             completion_time = time.time()
 
-            # Store the result directly since we're operating sequentially
+            # Store the result directly
             self.results.append(
                 {
                     "question": question,
-                    "result": result,
+                    "result": output,  # Use the output from batch_generate_responses
                     "arrival_time": question.arrival_time,
                     "query_start_time": result.get("query_start_time", time.time()),
                     "query_completion_time": result.get("query_completion_time", time.time()),
@@ -324,7 +307,9 @@ class VLLMProcessor:
         """Export all timing information to a CSV file"""
         import csv
 
-        csv_filename = f"{self.model_name}_{self.arrival_rates}_{self.rate_change_interval}_question_timings_efficient.csv"
+        csv_filename = (
+            f"{self.model_name}_{self.arrival_rates}_{self.rate_change_interval}_question_timings_accelerate.csv"
+        )
         print(f"Exporting timing information to {csv_filename}")
 
         # Sort results by question arrival time
@@ -384,33 +369,33 @@ class VLLMProcessor:
         total_questions = len(self.questions)
         current_batch = []
 
-        print("\nStarting sequential VLLM processing with dynamic batch size")
+        print("\nStarting sequential baseline processing with dynamic batch size")
         print(f"Total questions: {total_questions}")
         print(f"Maximum batch size: {self.max_batch_size}")
         print(f"Dynamic batch sizing: arrival_rate * 4")
 
-        # 创建问题到达监控线程
+        # Create question arrival monitoring thread
         arrival_monitor_stop = threading.Event()
 
         def arrival_monitor():
-            """监控问题到达的线程函数"""
+            """Thread function that monitors question arrivals"""
             monitor_idx = 0
             while not arrival_monitor_stop.is_set() and monitor_idx < total_questions:
                 current_time = time.time()
-                # 检查问题到达
+                # Check for question arrivals
                 while monitor_idx < total_questions:
                     question = self.questions[monitor_idx]
-                    # 如果问题到达时间未到则等待
+                    # If question arrival time hasn't come yet, wait
                     if question.arrival_time > current_time:
                         break
-                    # 打印到达信息
+                    # Print arrival information
                     elapsed_time = question.arrival_time - self.base_time
                     print(f"Question arrived at {elapsed_time:.2f}s: {question.question_text[:50]}...")
                     monitor_idx += 1
-                # 短暂休眠以避免CPU占用过高
+                # Short sleep to avoid high CPU usage
                 time.sleep(0.1)
 
-        # 启动监控线程
+        # Start monitoring thread
         monitor_thread = threading.Thread(target=arrival_monitor)
         monitor_thread.daemon = True
         monitor_thread.start()
@@ -418,59 +403,67 @@ class VLLMProcessor:
         try:
             while next_question_idx < total_questions:
                 current_time = time.time()
-                
-                # 获取当前时间间隔和到达率
+
+                # Get current interval and arrival rate
                 current_interval = self.get_current_interval(current_time)
                 current_arrival_rate = self.arrival_rates[current_interval]
-                
-                # 计算当前间隔的目标批次大小
+
+                # Calculate current interval's target batch size
                 target_batch_size = min(int(current_arrival_rate * 4), self.max_batch_size)
-                target_batch_size = max(1, target_batch_size)  # 确保至少为1
-                
-                # 收集问题直到达到目标批次大小或没有更多已到达的问题
-                while (len(current_batch) < target_batch_size and 
-                    next_question_idx < total_questions and 
-                    self.questions[next_question_idx].arrival_time <= current_time):
+                target_batch_size = max(1, target_batch_size)  # Ensure at least 1
+
+                # Collect questions until reaching target batch size or no more arrived questions
+                while (
+                    len(current_batch) < target_batch_size
+                    and next_question_idx < total_questions
+                    and self.questions[next_question_idx].arrival_time <= current_time
+                ):
                     current_batch.append(self.questions[next_question_idx])
                     next_question_idx += 1
-                
-                # 如果已收集一些问题，并且达到目标批次大小或没有更多已到达的问题
-                if current_batch and (len(current_batch) >= target_batch_size or 
-                                    next_question_idx >= total_questions or
-                                    (next_question_idx < total_questions and 
-                                    self.questions[next_question_idx].arrival_time > current_time)):
+
+                # If some questions are collected, and reached target batch size or no more arrived questions
+                if current_batch and (
+                    len(current_batch) >= target_batch_size
+                    or next_question_idx >= total_questions
+                    or (
+                        next_question_idx < total_questions
+                        and self.questions[next_question_idx].arrival_time > current_time
+                    )
+                ):
                     batch_size = len(current_batch)
 
-                    # 记录批处理信息
+                    # Log batch processing info
                     print(f"\nCurrent interval: {current_interval}, Arrival rate: {current_arrival_rate}/min")
-                    print(f"Target batch size: {target_batch_size} (calculated as arrival_rate * 4 = {current_arrival_rate * 4})")
+                    print(
+                        f"Target batch size: {target_batch_size} (calculated as arrival_rate * 4 = {current_arrival_rate * 4})"
+                    )
                     print(f"Processing batch of {batch_size} questions sequentially")
 
-                    # 第1步：处理此批次的查询
+                    # Step 1: Process queries for this batch
                     print(f"Step 1: Query processing for batch at {time.time() - self.base_time:.2f}s")
                     batch, batch_results = self.process_batch_queries(current_batch)
                     print(f"Query processing completed at {time.time() - self.base_time:.2f}s")
 
-                    # 第2步：处理此批次的生成（等待直到完成）
+                    # Step 2: Process generation for this batch (wait until complete)
                     print(f"Step 2: Generation processing for batch at {time.time() - self.base_time:.2f}s")
                     self.process_batch_generation(batch, batch_results)
                     print(f"Generation completed at {time.time() - self.base_time:.2f}s")
 
                     print(f"Completed {next_question_idx}/{total_questions} questions")
                     current_batch = []
-                
-                # 如果批次中没有问题，需要等待下一个问题到达
+
+                # If no questions in batch, need to wait for next question arrival
                 if not current_batch and next_question_idx < total_questions:
                     wait_time = self.questions[next_question_idx].arrival_time - current_time
                     if wait_time > 0:
-                        time.sleep(min(wait_time, 1.0))  # 最多等待1秒
+                        time.sleep(min(wait_time, 1.0))  # Wait at most 1 second
 
         finally:
-            # 停止监控线程
+            # Stop monitoring thread
             arrival_monitor_stop.set()
             monitor_thread.join(timeout=1.0)
 
-        # 打印最终统计信息并导出结果
+        # Print final statistics and export results
         print("\n===== Final Statistics =====")
         print(f"Total questions processed: {len(self.results)}")
         print("============================\n")

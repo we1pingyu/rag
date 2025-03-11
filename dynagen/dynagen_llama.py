@@ -433,8 +433,8 @@ class LlamaLM(OptLM):
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.computation_policy = ComputationPolicyOptimize()
-        # self.computation_policy = ComputationPolicyImpl()
+        # self.computation_policy = ComputationPolicyOptimize()
+        self.computation_policy = ComputationPolicyImpl()
 
         layers = []
         layers.append(LlamaInputEmbed(self.config, self.env, self.policy))

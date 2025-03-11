@@ -198,7 +198,7 @@ class TorchDevice:
 
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         if self.device_type == DeviceType.CPU:
-            pin_memory = True if pin_memory is None else pin_memory
+            pin_memory = False if pin_memory is None else pin_memory
         else:
             pin_memory = False
         dtype = np_dtype_to_torch_dtype[dtype]
@@ -1043,7 +1043,7 @@ def copy_worker_func(queue, cuda_id):
 
 def rms_norm(input, weight, eps) -> torch.Tensor:
     input_dtype = input.dtype
-    hidden_states = input.to(torch.float32)
+    hidden_states = input.to(torch.float16)
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     return weight * hidden_states.to(input_dtype)

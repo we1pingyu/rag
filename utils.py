@@ -10,6 +10,7 @@ import random
 import functools
 import numpy as np
 import shutil
+import glob
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -73,7 +74,7 @@ def print_memory_usage(prefix: str = "") -> None:
     print(f"{prefix}Memory Usage - RSS: {memory_info['rss']:.2f} GB, VMS: {memory_info['vms']:.2f} GB")
 
 
-def split_batch(batch_size, max_split_size=32):
+def split_batch(batch_size, max_split_size=128):
     if batch_size <= max_split_size:
         return batch_size, 1
 
@@ -111,7 +112,7 @@ def init_dynagen_model(model_name, tokenizer, percent):
         act_cpu_percent=0,
         overlap=True,
         sep_layer=True,
-        pin_weight=False,
+        pin_weight=True,
         cpu_cache_compute=False,
         attn_sparsity=1.0,
         compress_weight=False,
@@ -144,6 +145,10 @@ class BatchResult:
     query_embeddings: Optional[torch.Tensor] = None
     query_results: Optional[List[Dict]] = None
     generation_results: Optional[List[Dict]] = None
+    query_start_time: Optional[float] = None
+    generation_start_time: Optional[float] = None
+    query_completion_time: Optional[float] = None
+
 
 
 def process_doc_initializer(tokenizer_name, chunk_size):
@@ -635,6 +640,15 @@ def batch_generate_responses(
     gc.collect()
     if dynagen:
         env.disk.clear_copy_threads()
+        cache_files = glob.glob("./dynagen_offload_dir/t_*")
+        for file_path in cache_files:
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+
+            except Exception as e:
+                continue
+        print(f"delete {len(cache_files)} files on disk")
     return batch_results, timing_stats
 
 

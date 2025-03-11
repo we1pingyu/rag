@@ -49,6 +49,10 @@ class OfflineProcessor:
             "generation_times": [],
         }
 
+    def estimate_cache_size(self, batch_size: int, layers=1) -> float:
+        """Estimate cache size in GB for given batch size"""
+        return self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
+
     def _process_batch(self, batch: List[Dict]):
         arrival_time = time.time()
         """处理单个batch并记录各阶段时间"""
@@ -123,10 +127,6 @@ class OfflineProcessor:
         print(f"Batch size: {self.batch_size}")
 
         total_start = time.time()
-
-        # 释放所有分区（如果使用Milvus）
-        if not self.resident_partitions:
-            self.collection.release()
 
         # 按batch处理所有问题
         batches = [self.questions[i : i + self.batch_size] for i in range(0, len(self.questions), self.batch_size)]

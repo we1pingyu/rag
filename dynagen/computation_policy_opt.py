@@ -56,7 +56,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
             return this.cache_loader.load_cache(True, lambda: this.load_weight(i, j, 0, overlap=False))
 
         def load_cache_async(i, j):
-            return this.cache_loader.load_cache(True, lambda: this.load_cache_dyn(i, j, 0, load_to_cpu=False))
+            return this.cache_loader.load_cache(True, lambda: this.load_cache_dyn(i, j, 0, load_to_cpu=True))
 
         # Create prefetching buffers
         weight_futures = [None for _ in range(this.num_layers)]
@@ -72,7 +72,7 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
             for j in range(this.num_layers):
                 # Prefetch weights and caches for upcoming layers
-                prefetch_distance = 2 if i == 0 else 2
+                prefetch_distance = 2 if i == 0 else 4
 
                 for offset in range(1, prefetch_distance + 1):
                     next_j = j + offset
@@ -112,14 +112,14 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
 
                 # Compute current layer
                 this.load_hidden(i, j, 0)
-                this.compute_layer(i, j, 0, cpu_delegation=None)
+                this.compute_layer(i, j, 0, cpu_delegation=1)
 
                 if j == this.num_layers - 1:
                     this.sync()
 
                 this.store_cache(i, j - 1, 0)
                 this.store_hidden(i, j, 0)
-                this.sync()
+                # this.sync()
 
                 if i == 0:
                     this.sync()
@@ -197,9 +197,9 @@ class ComputationPolicyOptimize(ComputationPolicyInterface):
                     this.load_hidden(i, j, k + 1)
                     this.compute_layer(i, j, k)
                     this.store_cache(i, j, k - 1, overlap=False)
-                    if j == this.num_layers - 1:
-                        this.sync()
-
+                    # if j == this.num_layers - 1:
+                    this.sync()
+                    
             # Check for early stopping condition
             if this.task.stop and np.all(this.stopped):
                 break

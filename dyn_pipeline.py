@@ -5,6 +5,7 @@ import json
 import os
 import glob
 import csv
+from sklearn.linear_model import LinearRegression
 from queue import Queue, Empty
 from threading import Event, Thread, Lock
 from typing import List, Dict
@@ -22,7 +23,7 @@ from scipy.optimize import linprog
 from pymilvus import Partition
 
 min_batch = 32
-
+batch_sizes = [32]
 
 class DynPipelineProcessor:
 
@@ -50,7 +51,7 @@ class DynPipelineProcessor:
             Question(question_text=q["question"], doc_id=q["doc_id"], arrival_time=0.0) for q in questions
         ]
         self.batch_size = batch_size
-        self.arrival_rates = arrival_rates if arrival_rates else [16, 32, 64]
+        self.arrival_rates = arrival_rates
         self.rate_change_interval = rate_change_interval
         self.embedding_model = embedding_model
         self.model_name = model_name
@@ -66,7 +67,7 @@ class DynPipelineProcessor:
         self.total_cpu_gb = total_cpu_gb
         self.gpu_memory_gb = gpu_memory_gb
         self.partition_size_gb = partition_size_gb
-        self.total_weight_gb = self.model_config.model_bytes() / (1024**3)
+        self.total_weight_gb = 2 * self.model_config.model_bytes() / (1024**3)
         self.compute_weight_gb = self.total_weight_gb / self.model_config.num_hidden_layers
         self.max_disk_percent = max_disk_percent
 
@@ -89,9 +90,9 @@ class DynPipelineProcessor:
         self.next_config_update_time = self.base_time + self.rate_change_interval
         self.current_config = {
             "batch_size": self.batch_size,
-            "cache_gpu_percent": 50,
+            "cache_gpu_percent": 0,
             "cache_cpu_percent": 50,
-            "w_gpu_percent": 50,
+            "w_gpu_percent": 0,
             "w_cpu_percent": 50,
             "resident_partitions": resident_partitions,
         }
@@ -113,8 +114,8 @@ class DynPipelineProcessor:
                 "intercept": float(self.query_model.intercept_),
             }
         else:
-            print("Not enough training data to learn cost models. Exiting.")
-            return
+            self.inf_model_params = None
+            self.query_model_params = None
 
         np.random.seed(seed)
         self.all_results = []
@@ -138,12 +139,6 @@ class DynPipelineProcessor:
 
     def learning_cost_model(self, training_data):
         """Build a cost model to predict inference and query latencies based on loaded samples"""
-        import numpy as np
-        from sklearn.linear_model import LinearRegression
-        import json
-        import os
-        import math
-
         # Create feature matrices
         # Inference latency model features: based on the formula
         # a * w_gpu_percent + b * w_cpu_percent + c * cache_gpu_percent * batch_size +
@@ -286,7 +281,7 @@ class DynPipelineProcessor:
 
     def estimate_cache_size(self, batch_size: int, layers=1) -> float:
         """Estimate cache size in GB for given batch size"""
-        return self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
+        return 2 * self.model_config.cache_bytes(batch_size, 512 + 16, layers) / (1024**3)
 
     def estimate_total_working_memory(self, batch_size: int) -> float:
         """Estimate total working memory needed for computation, including attention and MLP states"""
@@ -454,9 +449,6 @@ class DynPipelineProcessor:
         current_queue_size = self.question_queue.qsize()
         print(f"Current queue size: approximately {current_queue_size} questions")
 
-        # Available batch sizes
-        batch_sizes = [32, 64, 96, 128, 160, 192, 224]
-
         # Choose appropriate batch size based on queue size
         optimal_batch_size = self.batch_size  # default to current
 
@@ -464,9 +456,9 @@ class DynPipelineProcessor:
         # and doesn't exceed GPU memory
         for batch_size in sorted(batch_sizes, reverse=True):
             # Skip this batch size if it exceeds GPU memory
-            if self.gpu_memory_available(batch_size) <= 0:
-                print(f"Batch size {batch_size} exceeds GPU compute space")
-                continue
+            # if self.gpu_memory_available(batch_size) <= 0:
+            #     print(f"Batch size {batch_size} exceeds GPU compute space")
+            #     continue
 
             if batch_size <= current_queue_size:
                 optimal_batch_size = batch_size
@@ -485,10 +477,83 @@ class DynPipelineProcessor:
             "resident_partitions": self.current_config["resident_partitions"],
         }
 
+    def find_best_config_from_samples(self, target_batch_size):
+        """Find best configuration from existing batch samples when optimization fails"""
+        print(f"Finding best configuration from samples for batch size {target_batch_size}")
+
+        # Get all batch sample files
+        batch_files = glob.glob(f"{self.model_name}_data/batch_*_samples.json")
+
+        all_samples = []
+
+        # Collect all samples from all batch files
+        for batch_file in batch_files:
+            try:
+                with open(batch_file, "r") as f:
+                    samples = json.load(f)
+                    all_samples.extend([s for s in samples if s.get("success", False)])
+            except Exception as e:
+                print(f"Error processing batch file {batch_file}: {e}")
+
+        print(f"Loaded {len(all_samples)} successful samples from {len(batch_files)} batch files")
+
+        # First try: Find samples with exactly matching batch size
+        matching_samples = [s for s in all_samples if s.get("batch_size") == target_batch_size]
+
+        # Second try: If no exact matches, find the closest batch size
+        if not matching_samples:
+            print(f"No exact batch size matches found for {target_batch_size}, looking for closest")
+
+            # Standard batch sizes
+            standard_sizes = batch_sizes
+
+            # Try to find closest standard batch size
+            closest_size = min(standard_sizes, key=lambda x: abs(x - target_batch_size))
+            print(f"Closest standard batch size is {closest_size}")
+
+            matching_samples = [s for s in all_samples if s.get("batch_size") == closest_size]
+
+            # If still no matches, just take all samples and we'll find the best regardless of batch size
+            if not matching_samples:
+                print(f"No samples found for batch size {closest_size}, using all available samples")
+                matching_samples = all_samples
+
+        print(f"Found {len(matching_samples)} candidate samples to evaluate")
+
+        # Find the sample with minimum max(gen_time, query_time)
+        best_sample = None
+        best_max_latency = float("inf")
+
+        for sample in matching_samples:
+            gen_time = sample.get("avg_gen_time", float("inf"))
+            query_time = sample.get("avg_query_time", float("inf"))
+            max_latency = max(gen_time, query_time)
+
+            if max_latency < best_max_latency:
+                best_max_latency = max_latency
+                best_sample = sample
+
+        if best_sample:
+            print(
+                f"Best sample found with batch size {best_sample.get('batch_size')} and max latency {best_max_latency:.4f}s"
+            )
+            return {
+                "batch_size": target_batch_size,  # Use target batch size, not the sample's
+                "cache_gpu_percent": best_sample.get("cache_gpu_percent", 50),
+                "cache_cpu_percent": best_sample.get("cache_cpu_percent", 50),
+                "w_gpu_percent": best_sample.get("w_gpu_percent", 50),
+                "w_cpu_percent": best_sample.get("w_cpu_percent", 50),
+                "resident_partitions": best_sample.get("resident_partitions", 0),
+                "predicted_inf_latency": best_sample.get("avg_gen_time", 1.0),
+                "predicted_query_latency": best_sample.get("avg_query_time", 1.0),
+                "max_latency": best_max_latency,
+            }
+
     def find_optimal_config_with_linprog(self, batch_size):
         """Find optimal configuration for a given batch size using linear programming with disk constraints"""
         print(f"Finding optimal configuration for batch size {batch_size} using linear programming")
-
+        if not self.inf_model_params or not self.query_model_params:
+            return self.find_best_config_from_samples(batch_size)
         # Extract model parameters
         inf_coef = self.inf_model_params["coefficients"]
         inf_intercept = self.inf_model_params["intercept"]
@@ -556,9 +621,6 @@ class DynPipelineProcessor:
         b_weight_min = -min_memory_percent  # At least min_memory_percent of weights must be in memory
 
         # 9. NEW CONSTRAINT: Weight and cache on disk <= max_disk_percent of total weight and cache
-        # Disk weight = (100 - w_gpu - w_cpu) * total_weight_gb / 100
-        # Disk cache = (100 - cache_gpu - cache_cpu) * cache_size / 100
-        # Constraint: Disk weight + Disk cache <= max_disk_percent * (total_weight_gb + cache_size)
         A_disk_limit = [
             -self.total_weight_gb / 100,  # w_gpu_percent coefficient
             -self.total_weight_gb / 100,  # w_cpu_percent coefficient
@@ -692,12 +754,14 @@ class DynPipelineProcessor:
                     "max_latency": float(max_latency),
                 }
             else:
-                print(f"Optimization failed: {result.message}")
-                return None
+                # print(f"Optimization failed: {result.message}")
+                print("Using samples to find best configuration")
+                return self.find_best_config_from_samples(batch_size)
 
         except Exception as e:
             print(f"Error in optimization: {e}")
-            return None
+            # Use fallback method to find the best config from existing samples
+            return self.find_best_config_from_samples(batch_size)
 
     def predict_latencies(self, config, batch_size):
         """Predict inference and query latencies using the cost models"""
@@ -830,10 +894,10 @@ class DynPipelineProcessor:
         print(f"Target counts: {self.interval_question_count}")
 
     def update_model_policy_for_batch(self, batch_size):
-        """Update model policy specifically for the current batch size"""
+        """Calculate policy parameters for the current batch size without updating the model"""
         # For non-standard batch sizes, round up to the nearest standard batch size
         # This avoids assertion errors when processing small or odd-sized batches
-        standard_batch_sizes = [32, 64, 96, 128, 160, 192, 224]
+        standard_batch_sizes = batch_sizes
 
         # Find the next largest standard batch size
         policy_batch_size = batch_size
@@ -842,44 +906,25 @@ class DynPipelineProcessor:
                 policy_batch_size = std_size
                 break
 
-        print(f"Updating model policy for batch size {batch_size} (using policy size {policy_batch_size})")
-
+        print(f"Calculating policy parameters for batch size {batch_size} (using policy size {policy_batch_size})")
+        self.current_config = self.find_optimal_config_with_linprog(batch_size)
         # Split batch for the policy batch size, not the actual batch size
         batch_size_split, num_batch = split_batch(policy_batch_size)
 
         print(f"- Split batch size: {batch_size_split}, num_batch: {num_batch}")
 
-        try:
-            # Use current cache settings but update batch settings
-            self.model.update_policy(
-                self.current_config["cache_gpu_percent"],
-                self.current_config["cache_cpu_percent"],
-                batch_size_split,
-                num_batch,
-            )
-            print(f"Model policy updated for specific batch")
-        except Exception as e:
-            print(f"Error updating model policy for specific batch: {str(e)}")
+        # Return parameters without updating the model
+        return batch_size_split, num_batch
 
     def _query_worker(self):
-        """Execute query worker thread that processes as many questions as possible at once"""
+        """Execute query worker thread that processes all questions in queue at once"""
         loop_counter = 0
         total_queries_processed = 0
         current_interval_idx = 0
         first_batch = True
-        batch_sizes = [32, 64, 96, 128, 160, 192, 224]
 
-        # 根据设置的到达率，选择合适的最大批处理大小
-        max_questions = max(self.interval_question_count) if self.interval_question_count else 0
-        max_batch_size = 224
-
-        print(f"Query worker starting. Max questions per interval: {max_questions}")
-        print(f"Selected max batch size: {max_batch_size}")
+        print(f"Query worker starting. Target: {self.total_batches} batches")
         print(f"Target questions per interval: {self.interval_question_count}")
-
-        # 如果第一批次太大，调整等待策略
-        first_batch_size = min(4, max(8, max_questions // 2))
-        print(f"Will wait for batch size of {first_batch_size} before processing first batch")
 
         # Continue until all questions have been processed
         while not self.query_complete.is_set():
@@ -896,8 +941,7 @@ class DynPipelineProcessor:
                 current_interval_idx = interval_idx
 
             # Log status periodically
-            should_log = loop_counter % 20 == 0
-            if should_log:
+            if loop_counter % 20 == 0:
                 print(
                     f"[Query Loop #{loop_counter}] Status: batch={len(self.current_batch)}, "
                     f"queue~{self.question_queue.qsize()}, completed={self.completed_batches}/{self.total_batches}"
@@ -905,68 +949,33 @@ class DynPipelineProcessor:
                 print(f"Interval query counts: {self.interval_query_count}")
                 print(f"Target interval counts: {self.interval_question_count}")
 
-            # 获取当前队列大小
+            # Get current queue size
             current_queue_size = self.question_queue.qsize()
 
-            # 对第一批次使用较小的等待阈值
-            if first_batch and current_queue_size < first_batch_size:
-                if should_log:
-                    print(
-                        f"[Query Loop #{loop_counter}] Waiting for {first_batch_size} questions before processing first batch. Current: {current_queue_size}"
-                    )
-                time.sleep(0.1)
-                continue
+            # Only process questions if there are any in the queue
+            if current_queue_size > 0:
+                print(f"[Query Loop #{loop_counter}] Processing all {current_queue_size} questions in queue")
 
-            # For small remaining batches (less than 16), process them directly
-            if 0 < current_queue_size < min_batch:
-                optimal_batch_size = current_queue_size
-                print(f"[Query Loop #{loop_counter}] Processing small batch of {optimal_batch_size} questions directly")
-            else:
-                # 选择最优批处理大小，但不超过max_batch_size
-                optimal_batch_size = 2  # 默认最小值
-
-                # 找到不超过队列大小且不超过max_batch_size的最大批处理大小
-                for batch_size in sorted([bs for bs in batch_sizes if bs <= max_batch_size], reverse=True):
-                    if batch_size <= current_queue_size and self.gpu_memory_available(batch_size) > 0:
-                        optimal_batch_size = batch_size
-                        break
-
-            # 只在有问题且批处理大小有效时处理
-            if current_queue_size > 0 and optimal_batch_size > 0:
-                # 对首批使用之前计算的大小
-                if first_batch:
-                    optimal_batch_size = min(first_batch_size, optimal_batch_size)
-                    first_batch = False
-
-                print(
-                    f"[Query Loop #{loop_counter}] Selected batch size {optimal_batch_size} for {current_queue_size} queued questions"
-                )
-
-                # 重置当前批次并收集问题
+                # Reset current batch and collect all questions from queue
                 self.current_batch = []
 
-                # 从队列收集问题
-                collected_count = 0
-                for _ in range(optimal_batch_size):
-                    if not self.question_queue.empty():
-                        question = self.question_queue.get()
-                        self.current_batch.append(question)
-                        collected_count += 1
-                    else:
-                        break
+                # Get all questions from the queue at once
+                while not self.question_queue.empty():
+                    question = self.question_queue.get()
+                    self.current_batch.append(question)
 
-                print(f"[Query Loop #{loop_counter}] Collected {collected_count} questions for processing")
+                print(f"[Query Loop #{loop_counter}] Collected {len(self.current_batch)} questions for processing")
 
-                # 处理批次
+                # Process the batch
                 if len(self.current_batch) > 0:
-                    # 使用集中式函数更新计数
+                    # Update interval counts
                     self._update_interval_counts(self.current_batch, "queued")
 
                     with self.query_lock:
                         batch = self.current_batch
                         self.current_batch = []
 
-                        # 执行查询
+                        # Execute query
                         query_texts = [q.question_text for q in batch]
                         questions_dict = [{"question": q.question_text, "doc_id": q.doc_id} for q in batch]
 
@@ -986,14 +995,19 @@ class DynPipelineProcessor:
                             resident_partitions=self.resident_partitions,
                         )
                         self.timing_stats.update(updated_timing_stats)
+                        query_completion_time = time.time()
 
-                        # 将结果放入队列
+                        # Put results into queue
                         batch_result = BatchResult(
-                            questions=batch, query_embeddings=query_embeddings, query_results=batch_results
+                            questions=batch,
+                            query_embeddings=query_embeddings,
+                            query_results=batch_results,
+                            query_start_time=embed_start,
+                            query_completion_time=query_completion_time,
                         )
                         self.query_queue.put(batch_result)
 
-                        # 更新查询计数
+                        # Update query count
                         self._update_interval_counts(batch, "query")
 
                         total_queries_processed += len(batch)
@@ -1005,10 +1019,10 @@ class DynPipelineProcessor:
                         print(f"Total queries processed: {total_queries_processed}")
                         print_memory_usage("After query completion - ")
             else:
-                # 如果没有问题或批处理大小无效，休眠
+                # Sleep if there are no questions to process
                 time.sleep(0.1)
 
-                # 检查是否所有问题都已处理并且队列为空
+                # Check if all questions have been processed and queue is empty
                 if self.question_queue.empty() and total_queries_processed >= len(self.questions):
                     print(f"Query worker completed all available questions, setting query_complete signal")
                     self.query_complete.set()
@@ -1017,14 +1031,14 @@ class DynPipelineProcessor:
         print(f"Query worker completed all required queries")
 
     def _generation_worker(self):
-        """Execute generation worker thread with modified batching strategy that processes as many batch results as possible"""
+        """Execute generation worker thread that applies standard batch sizes and manages policy updates"""
         loop_counter = 0
         total_gens_processed = 0
         current_interval_idx = 0
         first_batch = True
 
         # Available batch sizes
-        available_batch_sizes = [32, 64, 96, 128, 160, 192, 224]
+        available_batch_sizes = batch_sizes
 
         print(f"Generation worker starting. Target: {self.total_batches} batches")
         print(f"Target questions by interval: {self.interval_question_count}")
@@ -1042,14 +1056,14 @@ class DynPipelineProcessor:
             if interval_idx != current_interval_idx:
                 print(f"Generation worker moving to interval {interval_idx} from {current_interval_idx}")
 
-                # Update policies when interval changes
+                # Calculate optimal policies when interval changes (but don't update model)
                 if not first_batch:
-                    print("Updating policies for new interval")
+                    print("Calculating policies for new interval")
                     self.update_policies_for_generation()
 
                 current_interval_idx = interval_idx
 
-            # Log less frequently
+            # Log status periodically
             if loop_counter % 10 == 0:
                 print(f"[Generation Loop #{loop_counter}] Status: {total_gens_processed} questions processed")
                 print(f"Interval generation counts: {self.interval_gen_count}")
@@ -1059,13 +1073,16 @@ class DynPipelineProcessor:
             try:
                 batch_result = self.query_queue.get(timeout=0.5)
 
-                # If this is the first batch, update policies
+                # If this is the first batch, calculate optimal policies (but don't update model)
                 if first_batch:
-                    print("First batch received, updating policies for generation")
+                    print("First batch received, calculating initial policies")
                     self.update_policies_for_generation()
                     first_batch = False
 
                 num_questions = len(batch_result.questions)
+                print(
+                    f"[Generation Loop #{loop_counter}] Received batch with {num_questions} questions from query worker"
+                )
 
                 # For small remaining batches, process them directly without splitting
                 if num_questions < min_batch:
@@ -1074,118 +1091,116 @@ class DynPipelineProcessor:
                         f"[Generation Loop #{loop_counter}] Processing small batch with {num_questions} questions directly"
                     )
                 else:
-                    # Choose largest batch size that doesn't exceed the number of questions
-                    chosen_batch_size = max([bs for bs in available_batch_sizes if bs <= num_questions], default=2)
-                    print(
-                        f"[Generation Loop #{loop_counter}] Processing batch with {num_questions} questions using batch size {chosen_batch_size}"
+                    # Choose largest standard batch size that doesn't exceed the number of questions
+                    chosen_batch_size = max(
+                        [bs for bs in available_batch_sizes if bs <= num_questions], default=min_batch
                     )
+                    print(f"[Generation Loop #{loop_counter}] Processing with standard batch size {chosen_batch_size}")
 
                 print_memory_usage("Before generation - ")
 
                 with self.generation_lock:
-                    # Process the questions and query results based on chosen batch size
-                    if chosen_batch_size < num_questions and num_questions >= 16:
-                        # We need to split the batch
-                        process_questions = batch_result.questions[:chosen_batch_size]
-                        process_query_results = batch_result.query_results[:chosen_batch_size]
+                    # Process the questions according to standard batch sizes
+                    remaining_questions = batch_result.questions.copy()
+                    remaining_query_results = batch_result.query_results.copy()
 
-                        # Put the remaining questions back in the queue for later
-                        remaining_questions = batch_result.questions[chosen_batch_size:]
-                        remaining_query_results = batch_result.query_results[chosen_batch_size:]
+                    while remaining_questions:
+                        # Take a batch of the standard size (or whatever is left)
+                        current_batch_size = min(chosen_batch_size, len(remaining_questions))
+                        process_questions = remaining_questions[:current_batch_size]
+                        process_query_results = remaining_query_results[:current_batch_size]
 
-                        # Create a new batch result for remaining questions
-                        remaining_batch = BatchResult(
-                            questions=remaining_questions,
-                            query_embeddings=batch_result.query_embeddings,  # Keep original embeddings
-                            query_results=remaining_query_results,
-                        )
-                        self.query_queue.put(remaining_batch)
-                        print(
-                            f"[Generation Loop #{loop_counter}] Put {len(remaining_questions)} remaining questions back in the queue"
-                        )
-                    else:
-                        # Process the entire batch
-                        process_questions = batch_result.questions
-                        process_query_results = batch_result.query_results
+                        # Remove processed questions from the remaining list
+                        remaining_questions = remaining_questions[current_batch_size:]
+                        remaining_query_results = remaining_query_results[current_batch_size:]
 
-                    # Update model policy for this specific batch size
-                    # The function now handles rounding to valid batch sizes
-                    self.update_model_policy_for_batch(len(process_questions))
+                        # Calculate parameters for this batch size without updating model
+                        batch_size_split, num_batch = self.update_model_policy_for_batch(current_batch_size)
 
-                    # Get current time for query completion
-                    query_completion_time = time.time()
+                        # Get current time for query completion
+                        generation_start_time = time.time()
 
-                    # Execute generation with exact batch size
-                    if (
-                        not len(process_questions)
-                        == self.model.policy.gpu_batch_size * self.model.policy.num_gpu_batches
-                    ):
-                        batch_size_split, num_batch = split_batch(len(process_questions))
+                        # SINGLE POLICY/WEIGHT UPDATE POINT
+                        # Only here we update the model policy and weights
+                        print(f"Updating model policy and weights for batch size {current_batch_size}")
                         self.model.update_policy(
                             self.current_config["cache_gpu_percent"],
                             self.current_config["cache_cpu_percent"],
                             batch_size_split,
                             num_batch,
                         )
-                    batch_responses, updated_timing_stats = batch_generate_responses(
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        batch_results=process_query_results,
-                        max_new_tokens=16,
-                        batch_size=len(process_questions),  # Use actual number of questions
-                        timing_stats=self.timing_stats,
-                        dynagen=True,
-                        env=self.env,
-                    )
-                    self.timing_stats.update(updated_timing_stats)
-
-                    self.completed_batches += 1
-
-                    # Get current time for generation completion
-                    generation_completion_time = time.time()
-
-                    # 使用集中式函数更新生成和完成计数
-                    self._update_interval_counts(process_questions, "gen")
-                    self._update_interval_counts(process_questions, "completion")
-
-                    total_gens_processed += len(process_questions)
-
-                    with self.results_lock:
-                        for q, r in zip(process_questions, batch_responses):
-                            # Calculate the interval for this question
-                            q_interval = min(
-                                int((q.arrival_time - self.base_time) / self.rate_change_interval),
-                                len(self.arrival_rates) - 1,
+                        self.model.update_weight(
+                            self.current_config["w_gpu_percent"], self.current_config["w_cpu_percent"]
+                        )
+                        if current_batch_size != self.model.policy.gpu_batch_size * self.model.policy.num_gpu_batches:
+                            batch_size_split, num_batch = split_batch(current_batch_size)
+                            self.model.update_policy(
+                                self.current_config["cache_gpu_percent"],
+                                self.current_config["cache_cpu_percent"],
+                                batch_size_split,
+                                num_batch,
                             )
+                        # Execute generation with exact batch size
+                        batch_responses, updated_timing_stats = batch_generate_responses(
+                            model=self.model,
+                            tokenizer=self.tokenizer,
+                            batch_results=process_query_results,
+                            max_new_tokens=16,
+                            batch_size=current_batch_size,  # Use actual number of questions
+                            timing_stats=self.timing_stats,
+                            dynagen=True,
+                            env=self.env,
+                        )
+                        self.timing_stats.update(updated_timing_stats)
 
-                            # 添加当前的policy信息
-                            self.all_results.append(
-                                {
-                                    "question": q,
-                                    "result": r,
-                                    "arrival_time": q.arrival_time,
-                                    "query_completion_time": query_completion_time,
-                                    "generation_completion_time": generation_completion_time,
-                                    "interval_id": q_interval,
-                                    "arrival_rate": self.arrival_rates[q_interval],
-                                    # 添加policy信息
-                                    "batch_size": self.current_config["batch_size"],
-                                    "w_gpu_percent": self.current_config["w_gpu_percent"],
-                                    "w_cpu_percent": self.current_config["w_cpu_percent"],
-                                    "cache_gpu_percent": self.current_config["cache_gpu_percent"],
-                                    "cache_cpu_percent": self.current_config["cache_cpu_percent"],
-                                    "resident_partitions": self.current_config["resident_partitions"],
-                                }
-                            )
+                        self.completed_batches += 1
 
-                    current_time = time.time() - self.base_time
-                    print(
-                        f"[Generation Loop #{loop_counter}] Generation completed at {current_time:.2f}s, "
-                        f"{self.completed_batches}/{self.total_batches} batches done"
-                    )
-                    print(f"Total generations processed: {total_gens_processed}")
-                    print(f"Interval generation counts: {self.interval_gen_count}")
-                    print_memory_usage("After generation - ")
+                        # Get current time for generation completion
+                        generation_completion_time = time.time()
+
+                        # Update generation and completion counts
+                        self._update_interval_counts(process_questions, "gen")
+                        self._update_interval_counts(process_questions, "completion")
+
+                        total_gens_processed += len(process_questions)
+
+                        with self.results_lock:
+                            for q, r in zip(process_questions, batch_responses):
+                                # Calculate the interval for this question
+                                q_interval = min(
+                                    int((q.arrival_time - self.base_time) / self.rate_change_interval),
+                                    len(self.arrival_rates) - 1,
+                                )
+
+                                # Add current policy information
+                                self.all_results.append(
+                                    {
+                                        "question": q,
+                                        "result": r,
+                                        "arrival_time": q.arrival_time,
+                                        "query_start_time": batch_result.query_start_time,
+                                        "query_completion_time": batch_result.query_completion_time,
+                                        "generation_start_time": generation_start_time,
+                                        "generation_completion_time": generation_completion_time,
+                                        "interval_id": q_interval,
+                                        "arrival_rate": self.arrival_rates[q_interval],
+                                        # Add policy information
+                                        "batch_size": self.current_config["batch_size"],
+                                        "w_gpu_percent": self.current_config["w_gpu_percent"],
+                                        "w_cpu_percent": self.current_config["w_cpu_percent"],
+                                        "cache_gpu_percent": self.current_config["cache_gpu_percent"],
+                                        "cache_cpu_percent": self.current_config["cache_cpu_percent"],
+                                        "resident_partitions": self.current_config["resident_partitions"],
+                                    }
+                                )
+
+                        current_time = time.time() - self.base_time
+                        print(
+                            f"[Generation Loop #{loop_counter}] Generation batch completed at {current_time:.2f}s, "
+                            f"{self.completed_batches}/{self.total_batches} batches done"
+                        )
+                        print(f"Total generations processed: {total_gens_processed}")
+                        print_memory_usage("After generation - ")
 
             except Empty:
                 # Queue is empty, don't log this every time
@@ -1193,13 +1208,11 @@ class DynPipelineProcessor:
                     print(f"[Generation Loop #{loop_counter}] Queue empty, waiting for more batches...")
                 time.sleep(0.2)  # Small sleep to prevent CPU spinning
 
-                # 检查是否所有查询都已完成且队列为空
+                # Check if all queries are completed and queue is empty
                 if self.query_complete.is_set() and self.query_queue.empty():
                     print(f"Generation worker: All queries completed and queue empty, setting gen_complete signal")
                     self.gen_complete.set()
                     break
-
-                continue
 
         print(f"Generation worker completed all required generations")
 
@@ -1250,8 +1263,8 @@ class DynPipelineProcessor:
             return sorted_results
 
     def update_policies_for_generation(self):
-        """Update model policy and weight distribution based on current configuration"""
-        print(f"\nUpdating policies for generation worker")
+        """Calculate optimal policy and weight distribution without updating the model"""
+        print(f"\nCalculating optimal policies for generation worker")
 
         # Find optimal configuration for the current interval
         optimal_config = self.find_optimal_config_with_linprog(self.batch_size)
@@ -1259,39 +1272,18 @@ class DynPipelineProcessor:
         if optimal_config:
             print(f"Found optimal configuration for batch size {self.batch_size}")
 
-            # Update model policy
+            # Calculate policy parameters
             batch_size_split, num_batch = split_batch(self.batch_size)
 
-            print(f"Updating model policy:")
+            print(f"Optimal policy parameters:")
             print(f"- Cache GPU%: {optimal_config['cache_gpu_percent']}")
             print(f"- Cache CPU%: {optimal_config['cache_cpu_percent']}")
-            print(f"- Split batch size: {batch_size_split}, num_batch: {num_batch}")
-
-            try:
-                self.model.update_policy(
-                    optimal_config["cache_gpu_percent"],
-                    optimal_config["cache_cpu_percent"],
-                    batch_size_split,
-                    num_batch,
-                )
-                print("Model policy updated successfully")
-            except Exception as e:
-                print(f"Error updating model policy: {str(e)}")
-
-            # Update weight distribution
-            print(f"Updating weight distribution:")
             print(f"- Weight GPU%: {optimal_config['w_gpu_percent']}")
             print(f"- Weight CPU%: {optimal_config['w_cpu_percent']}")
+            print(f"- Split batch size: {batch_size_split}, num_batch: {num_batch}")
 
-            try:
-                self.model.update_weight(optimal_config["w_gpu_percent"], optimal_config["w_cpu_percent"])
-                print("Weight distribution updated successfully")
-            except Exception as e:
-                print(f"Error updating weight distribution: {str(e)}")
-
-            # Update resident partitions
+            # Update resident partitions (this is still needed)
             old_resident = self.resident_partitions
-
             try:
                 self.resident_partitions = self.update_resident_partitions(optimal_config["resident_partitions"])
                 print(f"Updated resident partitions: {old_resident} -> {self.resident_partitions}")
@@ -1300,7 +1292,7 @@ class DynPipelineProcessor:
 
             # Update current configuration
             self.current_config = optimal_config
-            print("All policies updated successfully")
+            print("Configuration parameters calculated successfully")
         else:
             print("Failed to find optimal configuration, keeping current settings")
 
@@ -1399,7 +1391,9 @@ class DynPipelineProcessor:
                 "interval_id",
                 "arrival_rate",
                 "arrival_time",
+                "query_start_time",
                 "query_completion_time",
+                "generation_start_time",
                 "generation_completion_time",
                 "batch_size",
                 "w_gpu_percent",
@@ -1416,7 +1410,9 @@ class DynPipelineProcessor:
 
                 # Calculate relative times from base_time
                 arrival_time_rel = result["arrival_time"] - self.base_time
+                query_start_time_rel = result["query_start_time"] - self.base_time
                 query_completion_time_rel = result["query_completion_time"] - self.base_time
+                generation_start_time_rel = result["generation_start_time"] - self.base_time  # 添加生成开始时间
                 generation_completion_time_rel = result["generation_completion_time"] - self.base_time
 
                 # 添加包含policy信息的行
@@ -1426,7 +1422,9 @@ class DynPipelineProcessor:
                         "interval_id": result["interval_id"],
                         "arrival_rate": result["arrival_rate"],
                         "arrival_time": f"{arrival_time_rel:.4f}",
+                        "query_start_time": f"{query_start_time_rel:.4f}",
                         "query_completion_time": f"{query_completion_time_rel:.4f}",
+                        "generation_start_time": f"{generation_start_time_rel:.4f}",  # 添加生成开始时间
                         "generation_completion_time": f"{generation_completion_time_rel:.4f}",
                         "batch_size": result["batch_size"],
                         "w_gpu_percent": result["w_gpu_percent"],

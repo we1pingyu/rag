@@ -7,9 +7,10 @@ import torch
 import os
 import warnings
 import shutil
+import sys
 from pathlib import Path
 from pymilvus import connections, Collection
-from baseline import BaselineProcessor
+from accelerate_rag import AccelerateProcessor
 from active_profiling import ActiveProfilingProcessor
 from dyn_pipeline import DynPipelineProcessor
 from efficient_rag import VLLMProcessor
@@ -40,7 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--display_results", action="store_true", help="Whether to display final results")
     parser.add_argument("--cpu_memory_limit", type=int, default=166, help="CPU memory limit in GB")
     parser.add_argument("--gpu_memory_limit", type=int, default=12, help="GPU memory limit in GB")
-    parser.add_argument("--resident_partitions", type=int, default=0, help="Number of resident partitions")
+    parser.add_argument("--resident_partitions", type=int, default=1, help="Number of resident partitions")
     parser.add_argument(
         "--arrival_rates",
         type=float,
@@ -55,7 +56,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_partitions", type=int, default=32, help="Number of partitions for index building")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--baseline", action="store_true", help="Run in baseline (serial) mode with HF transformer")
+    mode_group.add_argument(
+        "--accelerate", action="store_true", help="Run in accelerate (serial) mode with HF transformer"
+    )
     mode_group.add_argument(
         "--dyn_pipeline", action="store_true", help="Run in dynamic pipeline mode with dynagen model"
     )
@@ -110,8 +113,18 @@ if __name__ == "__main__":
         print(f"Initial Milvus memory usage: {get_milvus_memory_usage():.2f} GB")
         partition_size_gb = get_milvus_memory_usage()
         available_cpu_mem = args.cpu_memory_limit - partition_size_gb * (args.resident_partitions + 1)
-        resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3), int(available_cpu_mem * 1024**3)))
+        resource.setrlimit(resource.RLIMIT_AS, (int(available_cpu_mem * 1024**3 * 1.2), -1))
         print(f"Set CPU available memory to {int(available_cpu_mem)} GB")
+
+        # Load metadata
+        metadata_path = Path(args.persist_dir) / "metadata.pkl"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
+        with open(metadata_path, "rb") as f:
+            metadata = pickle.load(f)
+            all_questions = metadata["questions"]
+            # random.shuffle(all_questions)
+            partition_names = metadata["partition_names"]
 
         # 加载 resident partitions
         if args.resident_partitions > 0:
@@ -132,17 +145,6 @@ if __name__ == "__main__":
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
-
-        # Load metadata
-        metadata_path = Path(args.persist_dir) / "metadata.pkl"
-        if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
-
-        with open(metadata_path, "rb") as f:
-            metadata = pickle.load(f)
-            all_questions = metadata["questions"]
-            # random.shuffle(all_questions)
-            partition_names = metadata["partition_names"]
 
         timing_stats = {}
         total_start_time = time.time()
@@ -165,11 +167,11 @@ if __name__ == "__main__":
                 total_cpu_gb=available_cpu_mem,
                 gpu_memory_gb=args.gpu_memory_limit,
             )
-        elif args.baseline:
-            print("\nRunning in baseline (serial) mode")
-            processor = BaselineProcessor(
+        elif args.accelerate:
+            print("\nRunning in Accelerate (serial) mode")
+            processor = AccelerateProcessor(
                 questions=all_questions[: args.total_questions],
-                batch_size=args.batch_size,
+                batch_size=32,
                 arrival_rates=args.arrival_rates,
                 rate_change_interval=args.rate_change_interval,
                 embedding_model=embedding_model,
@@ -222,7 +224,7 @@ if __name__ == "__main__":
                 model_name=args.model,
                 tokenizer=tokenizer,
                 collection=collection,
-                partition_names=partition_names,
+                partition_names=["partition_0"],
                 w_gpu_percent=args.percent[0],
                 w_cpu_percent=args.percent[1],
                 cache_gpu_percent=args.percent[2],
@@ -275,3 +277,4 @@ if __name__ == "__main__":
         connections.disconnect("default")
         if os.path.exists("./dynagen_offload_dir"):
             shutil.rmtree("./dynagen_offload_dir")
+        sys.exit(0)
