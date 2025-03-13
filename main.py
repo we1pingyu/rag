@@ -171,7 +171,7 @@ if __name__ == "__main__":
             print("\nRunning in Accelerate (serial) mode")
             processor = AccelerateProcessor(
                 questions=all_questions[: args.total_questions],
-                batch_size=32,
+                batch_size=args.batch_size,
                 arrival_rates=args.arrival_rates,
                 rate_change_interval=args.rate_change_interval,
                 embedding_model=embedding_model,

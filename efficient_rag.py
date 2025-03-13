@@ -93,7 +93,7 @@ class VLLMProcessor:
             raise
 
     def _generate_arrival_times(self):
-        """Generate arrival times based on time-varying arrival rates"""
+        """Generate arrival times based on time-varying arrival rates using a Poisson process"""
         # Ensure base_time is correctly set
         if self.base_time is None:
             self.base_time = time.time()
@@ -115,63 +115,71 @@ class VLLMProcessor:
         print(f"Expected questions per interval based on rates: {[int(q) for q in expected_questions_per_interval]}")
         print(f"Total expected questions: {int(total_expected_questions)}")
 
-        # Use the expected number of questions for each interval without scaling
-        questions_per_interval = [int(round(count)) for count in expected_questions_per_interval]
-
-        # Ensure question count doesn't exceed available questions
-        if len(self.questions) < total_expected_questions:
-            print(
-                f"Warning: Not enough questions available. Need {total_expected_questions} but only have {len(self.questions)}"
-            )
-            # Scale down question counts proportionally
-            scale_factor = len(self.questions) / total_expected_questions
-            questions_per_interval = [int(round(count * scale_factor)) for count in questions_per_interval]
-            # Ensure at least one question per interval
-            questions_per_interval = [max(1, count) for count in questions_per_interval]
-            # Adjust total to not exceed available questions
-            while sum(questions_per_interval) > len(self.questions):
-                # Find the largest interval and reduce by one
-                max_idx = questions_per_interval.index(max(questions_per_interval))
-                questions_per_interval[max_idx] -= 1
-
-        # Print final question allocation
-        print(f"Final questions per interval: {questions_per_interval}")
-        print(f"Total questions to be processed: {sum(questions_per_interval)}")
-
-        # Initialize tracking arrays for questions by interval
+        # Generate arrival times for each interval using Poisson process
+        all_arrivals = []
+        
+        for i, rate in enumerate(self.arrival_rates):
+            # Convert rate from questions/minute to questions/second
+            rate_per_second = rate / 60.0
+            
+            # Start and end time for this interval
+            interval_start = self.base_time + sum(interval_durations[:i])
+            interval_end = interval_start + interval_durations[i]
+            
+            # Generate arrival times using homogeneous Poisson process
+            current_time = interval_start
+            interval_arrivals = []
+            
+            while current_time < interval_end:
+                # Generate next inter-arrival time (exponential distribution)
+                inter_arrival = np.random.exponential(1.0 / rate_per_second)
+                current_time += inter_arrival
+                
+                if current_time < interval_end:
+                    interval_arrivals.append((current_time, i))  # (arrival_time, interval_id)
+            
+            all_arrivals.extend(interval_arrivals)
+            print(f"Interval {i}: Generated {len(interval_arrivals)} arrivals with rate {rate} q/min")
+        
+        # Sort all arrivals by time
+        all_arrivals.sort()
+        
+        # Check if we have enough questions available
+        if len(all_arrivals) > len(self.questions):
+            print(f"Warning: Generated {len(all_arrivals)} arrivals but only have {len(self.questions)} questions")
+            # Truncate arrivals to match available questions
+            all_arrivals = all_arrivals[:len(self.questions)]
+        
+        # Count questions per interval in the final set
+        questions_per_interval = [0] * len(self.arrival_rates)
+        for _, interval_id in all_arrivals:
+            questions_per_interval[interval_id] += 1
+        
+        # Initialize tracking arrays
         self.interval_question_count = questions_per_interval
         self.interval_completion_count = [0] * len(self.arrival_rates)
-
-        # Only use required number of questions, not all questions
-        used_questions = self.questions[: sum(questions_per_interval)]
-
-        # Assign interval ID for each question
-        question_index = 0
-        for i, question_count in enumerate(questions_per_interval):
-            for j in range(question_count):
-                if question_index < len(used_questions):
-                    # Set interval ID directly
-                    used_questions[question_index].interval_id = i
-                    # Set arrival time
-                    interval_start = self.base_time + sum(interval_durations[:i])
-                    # Distribute arrival times evenly
-                    used_questions[question_index].arrival_time = (
-                        interval_start + (j / question_count) * interval_durations[i]
-                        if question_count > 0
-                        else interval_start
-                    )
-                    question_index += 1
-
+        
+        # Assign arrival times to questions
+        used_questions = []
+        for i, (arrival_time, interval_id) in enumerate(all_arrivals):
+            if i < len(self.questions):
+                question = self.questions[i]
+                question.arrival_time = arrival_time
+                question.interval_id = interval_id
+                used_questions.append(question)
+        
         # Only process required questions
         self.questions = used_questions
-
+        
         # Sort questions by arrival time
         self.questions.sort(key=lambda x: x.arrival_time)
-
+        
         # Validate generated timestamps
         if self.questions:
             min_arrival = min(q.arrival_time for q in self.questions)
             max_arrival = max(q.arrival_time for q in self.questions)
+            print(f"Final questions per interval: {questions_per_interval}")
+            print(f"Total questions to be processed: {sum(questions_per_interval)}")
             print(f"Arrival times range: {min_arrival - self.base_time:.2f}s to {max_arrival - self.base_time:.2f}s")
 
     def get_current_interval(self, current_time):
