@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=0 python main.py --total_questions 2000 --batch_size 64 --a
 CUDA_VISIBLE_DEVICES=0 python main.py --active --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 256 --gpu_memory_limit 24 
 
 # running phase
-CUDA_VISIBLE_DEVICES=0 python main.py --total_questions 2000 --batch_size 8 --dyn_pipeline --arrival_rates 4 8 12 16 --rate_change_interval 1200  --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 256 --gpu_memory_limit 24
+CUDA_VISIBLE_DEVICES=0 python main.py --total_questions 2000 --dyn_pipeline --arrival_rates 4 8 12 16 --rate_change_interval 1200  --model meta-llama/Llama-3.1-70B-Instruct --cpu_memory_limit 256 --gpu_memory_limit 24
 # vllm
 CUDA_VISIBLE_DEVICES=0 python main.py --total_questions 2000 --batch_size 32 --vllm --arrival_rates 4 8 12 16 --model meta-llama/Llama-3.1-70B-Instruct --rate_change_interval 1200 --resident_partitions 2 --cpu_memory_limit 256 --gpu_memory_limit 24 
 # accelerate
